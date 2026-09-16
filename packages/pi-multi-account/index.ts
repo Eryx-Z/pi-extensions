@@ -2860,7 +2860,7 @@ function antigravitySlotModels(): Array<Record<string, unknown>> {
 	return getCurrentAntigravityCatalog().models.map((model) => ({ ...model }));
 }
 
-function registerAntigravitySlot(
+export function registerAntigravitySlot(
 	pi: ExtensionAPI,
 	id: string,
 	displayName?: string,
@@ -3647,6 +3647,14 @@ function anthropicOAuthOverride(providerId: string, name: string) {
 // ===========================================================================
 
 export default function piMultiAccount(pi: ExtensionAPI) {
+	// Advertise a provider-only child entrypoint, not this extension's account
+	// rotation, session hooks, commands or model-selection behavior.
+	pi.events.on("rpc-subagents:provider-source:v1", (data: unknown) => {
+		const request = data as { provider?: string; register?: (path: string) => void };
+		if (request && typeof request.provider === "string" && /^antigravity(?:-account-\d+)?$/.test(request.provider) && typeof request.register === "function") {
+			request.register(fileURLToPath(new URL("./subagent-provider.ts", import.meta.url)));
+		}
+	});
 	// Warm up the OAuth helpers before any provider registration: providers are
 	// registered synchronously below and their `usesCallbackServer`/`getApiKey`
 	// read from the cached module. Deliberately NON-fatal — if pi-ai's oauth entry

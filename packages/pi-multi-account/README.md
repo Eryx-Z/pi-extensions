@@ -4,6 +4,10 @@ Automatic multi-account failover & rotation for [Pi Agent](https://pi.dev/), acr
 
 When the account you are using hits a quota or rate limit, `pi-multi-account` transparently switches to the next authenticated account/model and (optionally) resumes the interrupted task — so a long agent run does not die just because one account ran out of budget.
 
+## RPC subagent model inheritance
+
+For compatible `pi-interactive-subagents` versions, this extension answers the synchronous `rpc-subagents:provider-source:v1` discovery event for `antigravity` and `antigravity-account-N`. It advertises `subagent-provider.ts`, a provider-only child entrypoint that registers only the account selected in the frozen loadout. It installs no tools, UI hooks, model restoration or automatic failover. Read-only child tool restrictions remain unchanged; provider code is trusted code, not a filesystem sandbox. Both updated extensions must be loaded in the parent. Other provider families are unchanged.
+
 ## What it does
 
 - **Auto-discovers** every authenticated account from `~/.pi/agent/auth.json` (Anthropic Claude Pro/Max, OpenAI/ChatGPT Codex, Google Antigravity, Kimi For Coding, Cursor, Qwen/Alibaba, and Ollama) and builds the failover rotation dynamically — no manual config editing.
