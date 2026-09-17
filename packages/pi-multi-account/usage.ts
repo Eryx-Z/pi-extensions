@@ -19,6 +19,8 @@ export type UsageSnapshot = {
 	fetchedAt: number;
 	credentialHash?: string;
 	plan?: string;
+	/** Sanitized partial subscription-query failure; quotas may still be fresh. */
+	planWarning?: string;
 	/**
 	 * Which real account this is — the email the provider reports, when it reports one.
 	 *
@@ -46,6 +48,14 @@ export type UsageSnapshot = {
 	/** Number of provider-granted manual rate-limit resets still available. */
 	rateLimitResetCredits?: number;
 };
+
+export function preserveKnownPlan(snapshot: UsageSnapshot, previous?: UsageSnapshot): UsageSnapshot {
+	if (snapshot.family !== "antigravity" || !snapshot.planWarning || snapshot.plan ||
+		!snapshot.credentialHash || snapshot.credentialHash !== previous?.credentialHash ||
+		snapshot.provider !== previous.provider || snapshot.account !== previous.account ||
+		!previous.plan || previous.plan === "subscription") return snapshot;
+	return { ...snapshot, plan: previous.plan };
+}
 
 export type UsageCredential = {
 	type?: string;
@@ -471,10 +481,11 @@ async function fetchAntigravityUsageSnapshot(
 	];
 
 	// 1. loadCodeAssist for plan tier + project
+	const planFailures: string[] = [];
 	for (const ep of candidateEndpoints) {
+		const controller = new AbortController();
+		const timer = setTimeout(() => controller.abort(), timeout);
 		try {
-			const controller = new AbortController();
-			const timer = setTimeout(() => controller.abort(), timeout);
 			const res = await fetchImpl(
 				`${ep}/v1internal:loadCodeAssist`,
 				{
@@ -490,18 +501,29 @@ async function fetchAntigravityUsageSnapshot(
 					signal: controller.signal,
 				},
 			);
-			clearTimeout(timer);
+			if (res.status === 401) {
+				throw new UsageFetchError("Antigravity loadCodeAssist: HTTP 401", 401);
+			}
 			if (res.ok) {
 				endpoint = ep;
 				const data = (await res.json()) as any;
-				tierName = data.currentTier?.name || data.currentTier?.id;
-				if (!projectId && data.cloudaicompanionProject) {
+				tierName = [data.paidTier?.name, data.paidTier?.id,
+					data.currentTier?.name, data.currentTier?.id]
+					.find((value) => typeof value === "string" && value.trim());
+				if (!projectId && typeof data.cloudaicompanionProject === "string") {
 					projectId = data.cloudaicompanionProject;
 				}
-				break;
+				if (tierName) break;
+				planFailures.push(`${new URL(ep).hostname}: missing tier`);
+			} else {
+				planFailures.push(`${new URL(ep).hostname}: HTTP ${res.status}`);
 			}
-		} catch {
-			// loadCodeAssist is best-effort
+		} catch (error) {
+			if (error instanceof UsageFetchError && error.status === 401) throw error;
+			// Do not expose response bodies, tokens, or arbitrary transport error messages.
+			planFailures.push(`${new URL(ep).hostname}: ${controller.signal.aborted ? "timeout" : "request/response failed"}`);
+		} finally {
+			clearTimeout(timer);
 		}
 	}
 
@@ -654,7 +676,8 @@ async function fetchAntigravityUsageSnapshot(
 		family: "antigravity",
 		fetchedAt: Date.now(),
 		credentialHash: options.credentialHash,
-		plan: tierName ?? "subscription",
+		plan: tierName,
+		planWarning: tierName ? undefined : `Antigravity subscription: ${planFailures.join("; ")}`,
 		account: email,
 		serviceable,
 		primary,

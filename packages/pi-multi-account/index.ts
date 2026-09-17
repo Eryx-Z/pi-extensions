@@ -445,6 +445,7 @@ import {
 } from "./model-catalog.ts";
 import {
 	fetchUsageSnapshot,
+	preserveKnownPlan,
 	formatResetDuration,
 	formatUsageCompact,
 	formatUsageDetails,
@@ -4865,8 +4866,10 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	}
 
 	function storeUsage(ctx: any, snapshot: UsageSnapshot) {
+		snapshot = preserveKnownPlan(snapshot, usageByProvider.get(snapshot.provider));
 		usageByProvider.set(snapshot.provider, snapshot);
-		usageErrors.delete(snapshot.provider);
+		if (snapshot.planWarning) usageErrors.set(snapshot.provider, snapshot.planWarning);
+		else usageErrors.delete(snapshot.provider);
 		// AUTHORITATIVE PROACTIVE BENCH. If the account's own usage endpoint reports a hard block (a
 		// window at >=100% with a future reset), record the cooldown NOW — even if the account never
 		// threw a limit error and had no prior cooldown. Without this, a known-spent account (a
@@ -8666,6 +8669,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				}
 				const display = displayUsageSnapshot(snapshot);
 				const parts: string[] = [];
+				if (snapshot.planWarning) parts.push(`订阅查询失败${snapshot.plan ? "（保留上次订阅）" : ""}: ${snapshot.planWarning}`);
 				if (display.serviceable === true) parts.push("可用");
 				else if (display.serviceable === false) parts.push("已用尽");
 				for (const [position, window] of [
