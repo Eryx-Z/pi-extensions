@@ -747,6 +747,42 @@ function mapToolChoiceMode(
   return GeminiToolCallingMode.Auto;
 }
 
+// Current Pi sends prompt/tool changes as system messages in the transcript;
+// older hosts still pass them as Context fields. Replay the current state for
+// this transport without requiring a newer pi-ai than our declared dependency.
+type SystemInstructionMessage = {
+  role: "system";
+  content: string | TextContent[];
+  sections?: Record<string, string | null>;
+  toolsAdded?: Tool[];
+  toolsRemoved?: { name: string }[];
+};
+
+function requestInstructions(context: Context): { prompt: string; tools: Tool[] } {
+  const content: string[] = [];
+  const sections = new Map<string, string>();
+  const tools = new Map<string, Tool>();
+  const messages = context.messages as (Context["messages"][number] | SystemInstructionMessage)[];
+  for (const message of messages) {
+    if (message.role !== "system") continue;
+    const text = typeof message.content === "string"
+      ? message.content
+      : message.content.filter((block) => block.type === "text").map((block) => block.text).join("\n");
+    if (text) content.push(text);
+    for (const [name, value] of Object.entries(message.sections ?? {})) {
+      if (value === null) sections.delete(name);
+      else sections.set(name, value);
+    }
+    for (const tool of message.toolsRemoved ?? []) tools.delete(tool.name);
+    for (const tool of message.toolsAdded ?? []) tools.set(tool.name, tool);
+  }
+  return {
+    prompt: [...content, ...sections.values()].filter(Boolean).join("\n\n") || context.systemPrompt || "",
+    tools: messages.some((message) => message.role === "system")
+      ? [...tools.values()] : context.tools ?? [],
+  };
+}
+
 /** Exported for unit tests. */
 export function buildRequest(
   model: Model<Api>,
@@ -758,8 +794,9 @@ export function buildRequest(
   const injectedSkills = context.messages.flatMap((msg) =>
     msg.role === "user" ? skillBlocks(msg.content) : [],
   );
-  const systemParts = context.systemPrompt
-    ? [{ text: sanitizeText(context.systemPrompt) }]
+  const { prompt, tools: declaredTools } = requestInstructions(context);
+  const systemParts = prompt
+    ? [{ text: sanitizeText(prompt) }]
     : [{ text: ANTIGRAVITY_SYSTEM_INSTRUCTION }, { text: ANTIGRAVITY_NO_PREAMBLE_INSTRUCTION }];
   systemParts.push(...injectedSkills.map((skill) => ({ text: sanitizeText(skill) })));
 
@@ -769,7 +806,7 @@ export function buildRequest(
       turn.role === GeminiRole.User &&
       turn.parts.some((part) => "text" in part && Boolean(part.text.trim())),
   );
-  if (!hasUserText && (injectedSkills.length > 0 || Boolean(context.systemPrompt))) {
+  if (!hasUserText && (injectedSkills.length > 0 || Boolean(prompt))) {
     contents.unshift({
       role: GeminiRole.User,
       parts: [{ text: "Apply the active system instructions." }],
@@ -797,7 +834,7 @@ export function buildRequest(
   if (Object.keys(generationConfig).length) request.generationConfig = generationConfig;
 
   const isClaude = model.id.startsWith("claude-") || runtimeModel.startsWith("claude-");
-  const tools = convertTools(context.tools, isClaude || model.id.startsWith("gpt-oss-"));
+  const tools = convertTools(declaredTools, isClaude || model.id.startsWith("gpt-oss-"));
   if (tools) {
     request.tools = tools;
   }
