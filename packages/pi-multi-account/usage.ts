@@ -5,7 +5,8 @@ export type UsageFamily =
 	| "cursor"
 	| "qwen"
 	| "kimi-coding"
-	| "antigravity";
+	| "antigravity"
+	| "xai";
 
 export type UsageWindow = {
 	usedPercent: number;
@@ -47,6 +48,11 @@ export type UsageSnapshot = {
 	};
 	/** Number of provider-granted manual rate-limit resets still available. */
 	rateLimitResetCredits?: number;
+	/**
+	 * Model-specific quota pools for multi-model providers like Antigravity.
+	 * Keyed by model display label (e.g. "Gemini", "Claude").
+	 */
+	modelQuotas?: Record<string, { primary?: UsageWindow; secondary?: UsageWindow }>;
 };
 
 export function preserveKnownPlan(snapshot: UsageSnapshot, previous?: UsageSnapshot): UsageSnapshot {
@@ -146,6 +152,8 @@ export function usageFamily(provider: string): UsageFamily | undefined {
 		return "kimi-coding";
 	if (provider === "antigravity" || /^antigravity-account-\d+$/.test(provider))
 		return "antigravity";
+	if (provider === "xai" || /^xai-account-\d+$/.test(provider))
+		return "xai";
 	return undefined;
 }
 
@@ -532,12 +540,12 @@ async function fetchAntigravityUsageSnapshot(
 	let secondary: UsageWindow | undefined;
 	let serviceable: boolean | undefined;
 
-	let geminiRemaining: number | undefined;
-	let geminiReset: number | undefined;
-	let geminiWindowSeconds = 5 * 3600;
-	let claudeRemaining: number | undefined;
-	let claudeReset: number | undefined;
-	let claudeWindowSeconds = 5 * 3600;
+	let modelQuotas: Record<string, { primary?: UsageWindow; secondary?: UsageWindow }> | undefined;
+
+	let gemini5h: { fraction: number; resetTime?: number } | undefined;
+	let geminiWeekly: { fraction: number; resetTime?: number } | undefined;
+	let claude5h: { fraction: number; resetTime?: number } | undefined;
+	let claudeWeekly: { fraction: number; resetTime?: number } | undefined;
 
 	// 2a. Try retrieveUserQuotaSummary first (returns exact group buckets)
 	try {
@@ -577,29 +585,18 @@ async function fetchAntigravityUsageSnapshot(
 						(typeof b.bucketId === "string" && b.bucketId.includes("weekly"));
 
 					if (is5h) {
-						best5h = { fraction, resetTime };
+						if (!best5h || fraction < best5h.fraction) best5h = { fraction, resetTime };
 					} else if (isWeekly) {
-						bestWeekly = { fraction, resetTime };
+						if (!bestWeekly || fraction < bestWeekly.fraction) bestWeekly = { fraction, resetTime };
 					}
 				}
 
-				let target = best5h;
-				let targetSeconds = 5 * 3600;
-				if (bestWeekly && (!target || bestWeekly.fraction < target.fraction)) {
-					target = bestWeekly;
-					targetSeconds = 7 * 86400;
-				}
-
-				if (target) {
-					if (isGemini) {
-						geminiRemaining = target.fraction;
-						geminiReset = target.resetTime;
-						geminiWindowSeconds = targetSeconds;
-					} else if (isClaude) {
-						claudeRemaining = target.fraction;
-						claudeReset = target.resetTime;
-						claudeWindowSeconds = targetSeconds;
-					}
+				if (isGemini) {
+					gemini5h = best5h;
+					geminiWeekly = bestWeekly;
+				} else if (isClaude) {
+					claude5h = best5h;
+					claudeWeekly = bestWeekly;
 				}
 			}
 		}
@@ -608,7 +605,7 @@ async function fetchAntigravityUsageSnapshot(
 	}
 
 	// 2b. Fall back to fetchAvailableModels if retrieveUserQuotaSummary yielded nothing
-	if (geminiRemaining === undefined && claudeRemaining === undefined) {
+	if (!gemini5h && !geminiWeekly && !claude5h && !claudeWeekly) {
 		try {
 			const controller = new AbortController();
 			const timer = setTimeout(() => controller.abort(), timeout);
@@ -635,14 +632,12 @@ async function fetchAntigravityUsageSnapshot(
 					const resetTime = qi.resetTime ? Date.parse(qi.resetTime) : undefined;
 
 					if (id.startsWith("gemini-") || id.startsWith("gemini_")) {
-						if (geminiRemaining === undefined || fraction < geminiRemaining) {
-							geminiRemaining = fraction;
-							geminiReset = resetTime;
+						if (!gemini5h || fraction < gemini5h.fraction) {
+							gemini5h = { fraction, resetTime };
 						}
 					} else if (id.startsWith("claude-") || id.startsWith("claude_")) {
-						if (claudeRemaining === undefined || fraction < claudeRemaining) {
-							claudeRemaining = fraction;
-							claudeReset = resetTime;
+						if (!claude5h || fraction < claude5h.fraction) {
+							claude5h = { fraction, resetTime };
 						}
 					}
 				}
@@ -652,23 +647,50 @@ async function fetchAntigravityUsageSnapshot(
 		}
 	}
 
-	if (geminiRemaining !== undefined) {
-		primary = {
-			usedPercent: Math.round((1 - geminiRemaining) * 100),
-			resetAt: geminiReset ?? Date.now() + geminiWindowSeconds * 1000,
-			windowSeconds: geminiWindowSeconds,
+	const buildWindow = (
+		item: { fraction: number; resetTime?: number } | undefined,
+		defaultSeconds: number,
+	): UsageWindow | undefined => {
+		if (!item) return undefined;
+		return {
+			usedPercent: Math.round((1 - item.fraction) * 100),
+			resetAt: item.resetTime ?? Date.now() + defaultSeconds * 1000,
+			windowSeconds: defaultSeconds,
 		};
-	}
-	if (claudeRemaining !== undefined) {
-		secondary = {
-			usedPercent: Math.round((1 - claudeRemaining) * 100),
-			resetAt: claudeReset ?? Date.now() + claudeWindowSeconds * 1000,
-			windowSeconds: claudeWindowSeconds,
-		};
+	};
+
+	const geminiPrimary = buildWindow(gemini5h, 5 * 3600);
+	const geminiSecondary = buildWindow(geminiWeekly, 7 * 86400);
+	const claudePrimary = buildWindow(claude5h, 5 * 3600);
+	const claudeSecondary = buildWindow(claudeWeekly, 7 * 86400);
+
+	if (geminiPrimary || geminiSecondary || claudePrimary || claudeSecondary) {
+		modelQuotas = {};
+		if (geminiPrimary || geminiSecondary) {
+			modelQuotas["Gemini"] = { primary: geminiPrimary, secondary: geminiSecondary };
+		}
+		if (claudePrimary || claudeSecondary) {
+			modelQuotas["Claude"] = { primary: claudePrimary, secondary: claudeSecondary };
+		}
 	}
 
-	if (geminiRemaining !== undefined || claudeRemaining !== undefined) {
-		serviceable = (geminiRemaining ?? 1) > 0 || (claudeRemaining ?? 1) > 0;
+	// For legacy consumers expecting primary (Gemini) and secondary (Claude)
+	const pickLegacyWindow = (
+		w5h: UsageWindow | undefined,
+		wWeekly: UsageWindow | undefined,
+	): UsageWindow | undefined => {
+		if (w5h && wWeekly) {
+			return (100 - wWeekly.usedPercent) < (100 - w5h.usedPercent) ? wWeekly : w5h;
+		}
+		return w5h ?? wWeekly;
+	};
+
+	primary = pickLegacyWindow(geminiPrimary, geminiSecondary);
+	secondary = pickLegacyWindow(claudePrimary, claudeSecondary);
+
+	const anyRemaining = [gemini5h, geminiWeekly, claude5h, claudeWeekly].filter(Boolean);
+	if (anyRemaining.length > 0) {
+		serviceable = anyRemaining.some((w) => (w?.fraction ?? 0) > 0);
 	}
 
 	return {
@@ -682,7 +704,189 @@ async function fetchAntigravityUsageSnapshot(
 		serviceable,
 		primary,
 		secondary,
+		modelQuotas,
 	};
+}
+
+const XAI_BILLING_URL =
+	"https://cli-chat-proxy.grok.com/v1/billing?format=credits";
+const XAI_SETTINGS_URL = "https://cli-chat-proxy.grok.com/v1/settings";
+
+function moneyVal(value: unknown): number | undefined {
+	if (typeof value === "number" && Number.isFinite(value)) return value;
+	return finiteNumber(record(value).val ?? record(value).value);
+}
+
+function xaiUsedPercent(value: unknown): number | undefined {
+	const raw = finiteNumber(value);
+	if (raw === undefined) return undefined;
+	// Grok CLI displays 1.0 as 1% used, not a normalized fraction.
+	return Math.min(100, Math.max(0, raw));
+}
+
+/**
+ * Grok CLI's own `/usage` reads this billing payload. SuperGrok often omits
+ * `creditUsagePercent`; inventing 0% used would show a full window that is not there.
+ */
+export function parseXaiUsageBodies(
+	provider: string,
+	billing: unknown,
+	settings: unknown,
+	fetchedAt = Date.now(),
+	credentialHash?: string,
+): UsageSnapshot {
+	const config = record(record(billing).config);
+	const period = record(config.currentPeriod);
+	const start = epochMs(period.start ?? config.billingPeriodStart);
+	const end = epochMs(period.end ?? config.billingPeriodEnd);
+	const windowSeconds =
+		start !== undefined && end !== undefined && end > start
+			? Math.round((end - start) / 1000)
+			: undefined;
+	const usedPercent = xaiUsedPercent(
+		config.creditUsagePercent ?? record(billing).creditUsagePercent,
+	);
+	const prepaid = moneyVal(config.prepaidBalance);
+	const onDemandCap = moneyVal(config.onDemandCap);
+	const onDemandUsed = moneyVal(config.onDemandUsed);
+	const settingsTier = record(settings).subscription_tier_display;
+	const billingTier = config.subscription_tier ?? config.subscriptionTier;
+	const tier =
+		typeof settingsTier === "string" && settingsTier.trim()
+			? settingsTier.trim()
+			: typeof billingTier === "string" && billingTier.trim()
+				? billingTier.trim()
+				: undefined;
+	const periodType = typeof period.type === "string" ? period.type : "";
+	const periodLabel = /month/i.test(periodType)
+		? "monthly"
+		: /week/i.test(periodType) || (windowSeconds !== undefined && windowSeconds >= 6 * 86_400)
+			? "weekly"
+			: undefined;
+
+	const primary =
+		usedPercent !== undefined && end !== undefined
+			? {
+					usedPercent,
+					resetAt: end,
+					...(windowSeconds !== undefined ? { windowSeconds } : {}),
+				}
+			: undefined;
+
+	const planParts: string[] = [];
+	if (tier) planParts.push(tier);
+	if (!primary && end !== undefined && periodLabel) {
+		planParts.push(
+			`${periodLabel} resets ${formatResetDuration(end, fetchedAt)}`,
+		);
+	}
+	if (prepaid !== undefined && prepaid > 0) planParts.push(`prepaid ${prepaid}`);
+	if (
+		onDemandCap !== undefined &&
+		onDemandCap > 0 &&
+		onDemandUsed !== undefined
+	)
+		planParts.push(`on-demand ${onDemandUsed}/${onDemandCap}`);
+	if (planParts.length === 0) planParts.push("subscription");
+
+	const onDemandLeft =
+		onDemandCap !== undefined && onDemandUsed !== undefined
+			? onDemandCap - onDemandUsed
+			: 0;
+	const serviceable =
+		usedPercent !== undefined && usedPercent >= 100
+			? (prepaid ?? 0) > 0 || onDemandLeft > 0
+			: undefined;
+
+	return {
+		provider,
+		family: "xai",
+		fetchedAt,
+		credentialHash,
+		plan: planParts.join(" · "),
+		serviceable,
+		primary,
+		credits:
+			prepaid === undefined
+				? undefined
+				: { balance: String(prepaid), hasCredits: prepaid > 0 },
+	};
+}
+
+async function fetchXaiUsageSnapshot(
+	provider: string,
+	credential: UsageCredential,
+	options: {
+		fetchImpl?: typeof fetch;
+		timeoutMs?: number;
+		credentialHash?: string;
+	},
+): Promise<UsageSnapshot> {
+	if (!credential.access) {
+		if (credential.key) {
+			return {
+				provider,
+				family: "xai",
+				fetchedAt: Date.now(),
+				credentialHash: options.credentialHash,
+				plan: "api-key · no subscription usage endpoint",
+			};
+		}
+		throw new UsageFetchError(`${provider} has no OAuth access token`);
+	}
+
+	const controller = new AbortController();
+	const timer = setTimeout(
+		() => controller.abort(),
+		options.timeoutMs ?? 10_000,
+	);
+	const fetchImpl = options.fetchImpl ?? fetch;
+	const headers = {
+		Authorization: `Bearer ${credential.access}`,
+		Accept: "application/json",
+	};
+	const getJson = async (url: string): Promise<unknown> => {
+		const response = await fetchImpl(url, {
+			method: "GET",
+			headers,
+			signal: controller.signal,
+		});
+		if (!response.ok) {
+			throw new UsageFetchError(
+				`${provider} usage endpoint returned HTTP ${response.status}`,
+				response.status,
+			);
+		}
+		return response.json();
+	};
+
+	try {
+		const billing = await getJson(XAI_BILLING_URL);
+		let settings: unknown;
+		try {
+			settings = await getJson(XAI_SETTINGS_URL);
+		} catch (error) {
+			if (error instanceof UsageFetchError && error.status === 401) throw error;
+			settings = undefined;
+		}
+		return parseXaiUsageBodies(
+			provider,
+			billing,
+			settings,
+			Date.now(),
+			options.credentialHash,
+		);
+	} catch (error) {
+		if (error instanceof UsageFetchError) throw error;
+		if ((error as { name?: string })?.name === "AbortError") {
+			throw new UsageFetchError(`${provider} usage request timed out`);
+		}
+		throw new UsageFetchError(
+			`${provider} usage request failed: ${error instanceof Error ? error.message : String(error)}`,
+		);
+	} finally {
+		clearTimeout(timer);
+	}
 }
 
 export async function fetchUsageSnapshot(
@@ -735,6 +939,9 @@ export async function fetchUsageSnapshot(
 			credentialHash: options.credentialHash,
 			plan: "api-key · no usage endpoint",
 		};
+	}
+	if (family === "xai") {
+		return fetchXaiUsageSnapshot(provider, credential, options);
 	}
 	if (credential.type !== "oauth" || !credential.access) {
 		throw new UsageFetchError(`${provider} has no OAuth access token`);
@@ -819,6 +1026,8 @@ export function providerUsageLabel(provider: string): string {
 		return index ? `Antigravity A${index}` : "Antigravity";
 	if (provider.startsWith("alibaba") || /^qwen/i.test(provider))
 		return index ? `Qwen A${index}` : "Qwen/Alibaba";
+	if (provider === "xai" || provider.startsWith("xai-account-"))
+		return index ? `xAI A${index}` : "xAI";
 	return provider;
 }
 

@@ -103,7 +103,7 @@ Use `/status` for the account overview (`/status full` for complete diagnostics)
 | Subcommand | Description |
 |---|---|
 | `status` (default) | Show a compact overview of the current model, limits, rotation, recovery, and actionable warnings. It refreshes every authenticated rotation account whose cache has expired (Codex: five minutes by default; Anthropic: at least ten minutes), even when the footer is disabled; repeated commands within that TTL use the cache. This is also available directly as `/status`; use `/status full` (aliases: `verbose`, `details`) for every diagnostic and registered login slot. |
-| `limits [refresh]` | Show active-account 5h/7d limits; `refresh` bypasses the cache. This explicit query works even when `showUsage` is false. Aliases: `usage`, `quota`. |
+| `limits [refresh]` | Show active-account limits; `refresh` bypasses the cache. Codex and Claude use their 5h/7d windows. xAI OAuth uses the Grok CLI billing period and subscription name, and only shows a percent when that endpoint publishes one. This explicit query works even when `showUsage` is false. Aliases: `usage`, `quota`. |
 | `rediscover` | Force a re-scan of `auth.json`, rebuild the rotation, and refresh Codex model catalogs now. |
 | `add [anthropic\|codex\|kimi\|antigravity\|cursor\|ollama\|qwen]` | Print the next free account slot to select from the interactive `/login` picker. Anthropic, Codex, Kimi, Cursor, and Antigravity are logged in through `/login`; API-key families are filled in `auth.json`. |
 | `remove [anthropic\|codex\|kimi\|antigravity\|cursor\|ollama\|qwen\|<provider-id>]` | Remove an account from `auth.json` and rotation. Family name drops the highest numbered alias slot; a full provider id removes that exact slot. Aliases: `rm`, `delete`. |

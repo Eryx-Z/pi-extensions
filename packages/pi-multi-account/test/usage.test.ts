@@ -8,6 +8,8 @@ import {
 	parseCodexUsageBody,
 	parseCodexUsageHeaders,
 	parseOllamaMeBody,
+	parseXaiUsageBodies,
+	usageFamily,
 } from "../usage.ts";
 
 const NOW = Date.UTC(2026, 5, 13, 12, 0, 0);
@@ -273,6 +275,120 @@ test("a footer for an account with no email is unchanged", () => {
 	assert.doesNotMatch(formatUsageCompact(snapshot!, Date.now()), /·\s*\|/);
 });
 
+test("xAI creditUsagePercent uses percent units even at or below one", () => {
+	for (const percent of [0, 0.5, 1, 50, 100]) {
+		const snapshot = parseXaiUsageBodies("xai", {
+			config: {
+				creditUsagePercent: percent,
+				currentPeriod: {
+					start: new Date(NOW).toISOString(),
+					end: new Date(NOW + 7 * 86_400_000).toISOString(),
+				},
+			},
+		}, undefined, NOW);
+		assert.equal(snapshot.primary?.usedPercent, percent);
+		assert.equal(snapshot.serviceable, percent === 100 ? false : undefined);
+		if (percent === 1) assert.match(formatUsageStatus(snapshot, NOW), /7d 99%/);
+	}
+});
+
+test("xAI OAuth usage reads Grok billing without inventing a full window", async () => {
+	assert.equal(usageFamily("xai"), "xai");
+	assert.equal(usageFamily("xai-account-2"), "xai");
+	assert.equal(usageFamily("openrouter"), undefined);
+
+	const periodEnd = new Date(NOW + 7 * 86_400_000).toISOString();
+	const quiet = parseXaiUsageBodies(
+		"xai",
+		{
+			config: {
+				currentPeriod: {
+					type: "USAGE_PERIOD_TYPE_WEEKLY",
+					start: new Date(NOW).toISOString(),
+					end: periodEnd,
+				},
+				prepaidBalance: { val: 0 },
+				onDemandCap: { val: 0 },
+				onDemandUsed: { val: 0 },
+			},
+		},
+		{ subscription_tier_display: "SuperGrok Plus" },
+		NOW,
+	);
+	assert.equal(quiet.primary, undefined, "missing percent must not become 100% left");
+	assert.equal(quiet.plan, "SuperGrok Plus · weekly resets 7d");
+	assert.equal(quiet.serviceable, undefined);
+
+	const spent = parseXaiUsageBodies(
+		"xai",
+		{
+			config: {
+				creditUsagePercent: 100,
+				currentPeriod: {
+					type: "USAGE_PERIOD_TYPE_WEEKLY",
+					start: new Date(NOW).toISOString(),
+					end: periodEnd,
+				},
+				prepaidBalance: { val: 0 },
+			},
+		},
+		undefined,
+		NOW,
+	);
+	assert.equal(spent.primary?.usedPercent, 100);
+	assert.equal(spent.serviceable, false);
+	assert.match(formatUsageStatus(spent, NOW), /7d 0%/);
+
+	const urls: string[] = [];
+	const liveEnd = new Date(Date.now() + 7 * 86_400_000).toISOString();
+	const fetchImpl = (async (input: string | URL | Request) => {
+		urls.push(String(input));
+		const url = String(input);
+		if (url.includes("/settings")) {
+			return new Response(
+				JSON.stringify({ subscription_tier_display: "SuperGrok Plus" }),
+				{ status: 200 },
+			);
+		}
+		return new Response(
+			JSON.stringify({
+				config: {
+					currentPeriod: {
+						type: "USAGE_PERIOD_TYPE_WEEKLY",
+						end: liveEnd,
+					},
+					prepaidBalance: { val: 12 },
+				},
+			}),
+			{ status: 200 },
+		);
+	}) as typeof fetch;
+	const snapshot = await fetchUsageSnapshot(
+		"xai",
+		{ type: "oauth", access: "secret-xai-token" },
+		{ fetchImpl, credentialHash: "safe-hash" },
+	);
+	assert.ok(urls.some((url) => url.includes("/v1/billing?format=credits")));
+	assert.equal(snapshot.plan, "SuperGrok Plus · weekly resets 7d · prepaid 12");
+	assert.equal(snapshot.credentialHash, "safe-hash");
+	assert.doesNotMatch(JSON.stringify(snapshot), /secret-xai-token/);
+
+	let called = false;
+	const apiKey = await fetchUsageSnapshot(
+		"xai",
+		{ type: "api_key", key: "xai-test-key" },
+		{
+			fetchImpl: (() => {
+				called = true;
+				throw new Error("api keys must not hit the subscription billing host");
+			}) as typeof fetch,
+		},
+	);
+	assert.equal(called, false);
+	assert.match(apiKey.plan ?? "", /api-key/);
+	assert.equal(apiKey.primary, undefined);
+});
+
 test("a Kimi Coding slot reports itself instead of throwing", async () => {
 	// kimi-coding became a managed family, but nothing taught the usage layer about it — so every
 	// probe fell through to the OAuth branch and threw "has no OAuth access token" for a perfectly
@@ -445,6 +561,12 @@ test("an Antigravity slot parses usage windows from retrieveUserQuotaSummary", a
 	assert.ok(snapshot.secondary);
 	assert.equal(snapshot.secondary.usedPercent, 0);
 	assert.equal(snapshot.secondary.windowSeconds, 18000);
+
+	assert.ok(snapshot.modelQuotas);
+	assert.equal(snapshot.modelQuotas["Gemini"]?.primary?.usedPercent, 15);
+	assert.equal(snapshot.modelQuotas["Gemini"]?.secondary?.usedPercent, 3);
+	assert.equal(snapshot.modelQuotas["Claude"]?.primary?.usedPercent, 0);
+	assert.equal(snapshot.modelQuotas["Claude"]?.secondary?.usedPercent, 0);
 });
 
 test("a window is labelled by its real length, and the provider's verdict beats the percentage", () => {

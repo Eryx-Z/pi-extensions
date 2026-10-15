@@ -5582,9 +5582,11 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		return result;
 	}
 
-	/** Rotation members this extension carries but cannot measure — no quota endpoint, no OAuth. */
+	/** Rotation members this extension carries but cannot measure — no quota endpoint. */
 	function unmanagedRotationMembers(): string[] {
-		return rotation.filter((id) => !classifyProvider(id, config.qwenProvider));
+		return rotation.filter(
+			(id) => !classifyProvider(id, config.qwenProvider) && !usageFamily(id),
+		);
 	}
 
 	/**
@@ -8648,6 +8650,8 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 						return "Ollama";
 					case "qwen":
 						return "Qwen";
+					case "xai":
+						return "xAI";
 					default:
 						return provider.replace(/-account-\d+$/, "");
 				}
@@ -8672,14 +8676,29 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				if (snapshot.planWarning) parts.push(`订阅查询失败${snapshot.plan ? "（保留上次订阅）" : ""}: ${snapshot.planWarning}`);
 				if (display.serviceable === true) parts.push("可用");
 				else if (display.serviceable === false) parts.push("已用尽");
-				for (const [position, window] of [
-					["primary", display.primary],
-					["secondary", display.secondary],
-				] as const) {
-					if (!window) continue;
-					parts.push(
-						`${windowLabel(window, display.family, position)} 剩余 ${remainingPercent(window)}% · ${formatResetDuration(window.resetAt)} 后重置`,
-					);
+
+				if (display.family === "antigravity") {
+					// Only surface Gemini quota for Antigravity, keeping it on a single row exactly matching Codex.
+					const gemini = display.modelQuotas?.["Gemini"];
+					const geminiPrimary = gemini?.primary ?? (display.primary?.windowSeconds === 18000 ? display.primary : undefined);
+					const geminiSecondary = gemini?.secondary ?? (display.primary?.windowSeconds === 604800 ? display.primary : undefined);
+					if (geminiPrimary) {
+						parts.push(`5h 剩余 ${remainingPercent(geminiPrimary)}% · ${formatResetDuration(geminiPrimary.resetAt)} 后重置`);
+					}
+					if (geminiSecondary) {
+						parts.push(`7d 剩余 ${remainingPercent(geminiSecondary)}% · ${formatResetDuration(geminiSecondary.resetAt)} 后重置`);
+					}
+				} else {
+					for (const [position, window] of [
+						["primary", display.primary],
+						["secondary", display.secondary],
+					] as const) {
+						if (!window) continue;
+						const label = windowLabel(window, display.family, position);
+						parts.push(
+							`${label} 剩余 ${remainingPercent(window)}% · ${formatResetDuration(window.resetAt)} 后重置`,
+						);
+					}
 				}
 				if (
 					display.family === "codex" &&

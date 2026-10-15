@@ -6113,6 +6113,46 @@ test("status is compact by default and points to full diagnostics", async () => 
 	assert.match(fullStatus, /Resume watchdog/);
 });
 
+test("status displays Antigravity Gemini quota in a single row exactly matching Codex", async () => {
+	const now = Date.now();
+	const t = setup({
+		accounts: {
+			antigravity: { type: "oauth", access: "ag-1", refresh: "ag-r1", projectId: "ag-project-1" },
+		},
+		current: { provider: "antigravity", id: "gemini-3.8-flash" },
+		config: { autoDiscover: true, fallbacks: ["antigravity"] },
+		seedState: {
+			stateVersion: 5,
+			usageByProvider: {
+				antigravity: {
+					provider: "antigravity", family: "antigravity", fetchedAt: now,
+					credentialHash: createHash("sha256").update("ag-1").digest("hex").slice(0, 12),
+					account: "owner@example.com", plan: "Google AI Pro", serviceable: true,
+					primary: { usedPercent: 23, resetAt: now + 5 * 86_400_000, windowSeconds: 604800 },
+					secondary: { usedPercent: 11, resetAt: now + 4 * 3_600_000, windowSeconds: 18000 },
+					modelQuotas: {
+						Gemini: {
+							primary: { usedPercent: 0, resetAt: now + 5 * 3_600_000, windowSeconds: 18000 },
+							secondary: { usedPercent: 23, resetAt: now + 5 * 86_400_000, windowSeconds: 604800 },
+						},
+						Claude: {
+							primary: { usedPercent: 11, resetAt: now + 4 * 3_600_000, windowSeconds: 18000 },
+							secondary: { usedPercent: 5, resetAt: now + 6 * 86_400_000, windowSeconds: 604800 },
+						},
+					},
+				},
+			},
+		},
+	});
+	await t.command("", "status");
+	const status = t.rec.notifies.at(-1) ?? "";
+	assert.match(
+		status,
+		/owner@example\.com: Google AI Pro\s+当前\n {4}可用 {2}│ {2}5h 剩余 100% · [^\n]+ 后重置 {2}│ {2}7d 剩余 77% · [^\n]+ 后重置/,
+	);
+	assert.doesNotMatch(status, /Claude/);
+});
+
 test("status renders cached quota immediately and refreshes expired accounts in the background", {
 	concurrency: false,
 }, async () => {
