@@ -6,7 +6,18 @@ When the account you are using hits a quota or rate limit, `pi-multi-account` tr
 
 ## RPC subagent model inheritance
 
-For compatible `pi-interactive-subagents` versions, this extension answers the synchronous `rpc-subagents:provider-source:v1` discovery event for `antigravity` and `antigravity-account-N`. It advertises `subagent-provider.ts`, a provider-only child entrypoint that registers only the account selected in the frozen loadout. It installs no tools, UI hooks, model restoration or automatic failover. Read-only child tool restrictions remain unchanged; provider code is trusted code, not a filesystem sandbox. Both updated extensions must be loaded in the parent. Other provider families are unchanged.
+For `pi-agent-mesh` and compatible `pi-interactive-subagents` versions, this extension answers the synchronous `rpc-subagents:provider-source:v1` discovery event for `antigravity`, `antigravity-account-N`, `openai-codex` and `openai-codex-account-N`. It advertises `subagent-provider.ts`, a provider-only child entrypoint that registers only the account selected in the frozen loadout. It installs no tools, UI hooks, model restoration or automatic failover. Read-only child tool restrictions remain unchanged; provider code is trusted code, not a filesystem sandbox. Both updated extensions must be loaded in the parent. Codex children use the selected provider's stored OAuth. Custom `models.json` proxy routes remain intact; this plugin's exact published loopback slot route is instead accessed directly upstream using that slot's OAuth, retaining its published model metadata and avoiding dependence on the parent proxy's lifetime. Other provider families are unchanged.
+
+### Standalone ChatGPT/Codex and Grok fast modes
+
+Use `/fast` to see the current state and choose 开启 or 关闭. `/fast on`, `/fast off`, and `/fast status` skip the menu. Supports the current ChatGPT/Codex model (including account slots) and Grok 4.7; other models are left unchanged. Turning Grok fast on asks for confirmation because it costs more. Headless mode reports status instead of changing it. The longer commands below remain compatible.
+
+Neither `pi-grok-cli` nor `@gowthamgts/pi-codex-fast-mode` is required. Disable those separate extensions if installed, to avoid duplicate provider registration or conflicting request hooks. Pi itself and this package's normal dependencies are still required.
+
+- **ChatGPT/Codex:** sign in through Pi's `/login` (OpenAI Codex), then run `/multi-account fast codex on|off|status`. The shorter `/multi-account fast on|off|status` remains a Codex-only alias. Enabled requests use `service_tier: "priority"` on `openai-codex` and numbered account slots, including RPC children. The preference defaults to on and remains compatible with `codex-fast-mode.json` under the Pi agent directory.
+- **Grok:** `/login grok-cli`, then select `grok-cli/grok-4.7-build-fast` in `/model`. While using Grok 4.7, `/multi-account fast grok on|off|status` switches between `grok-4.7-build-fast` and `grok-4.7`. This is a model change, not a Codex service tier or global preference. Fast mode has higher usage cost. Other model families are not silently replaced.
+
+The bundled `grok/` implementation owns OAuth, token refresh, the model catalog, request sanitization, and streaming. Both the parent and provider-only RPC children use it. Existing Grok vault-marker logins and `GROK_CLI_OAUTH_TOKEN` remain supported; fresh logins use Pi's normal credential store. No existing credentials are moved or deleted. This integration does not add Grok account rotation, Imagine, or usage commands. See `grok/NOTICE.md` and `grok/LICENSE` for provenance.
 
 ## What it does
 

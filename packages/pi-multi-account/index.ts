@@ -76,6 +76,15 @@ import {
 	type ProxyRoute,
 } from "./slot-proxy.ts";
 import {
+	isCodexFastModel,
+	readCodexFastEnabled,
+	shapeCodexFastPayload,
+	writeCodexFastEnabled,
+} from "./codex-fast.ts";
+import { registerGrokProvider } from "./grok/register.ts";
+import { handleGrokFast } from "./grok/fast.ts";
+import { registerFastCommand } from "./fast-command.ts";
+import {
 	classifyChildUsability,
 	defaultRouteWarning,
 	type ChildUsability,
@@ -2833,6 +2842,48 @@ function registerCodexSlot(
 	});
 }
 
+function isOwnedCodexChildRoute(baseUrl: unknown, id: string): boolean {
+	if (typeof baseUrl !== "string") return false;
+	try {
+		const url = new URL(baseUrl);
+		return url.protocol === "http:" && url.hostname === "127.0.0.1" && !!url.port &&
+			url.pathname === `/${id}` && !url.search && !url.hash && !url.username && !url.password;
+	} catch {
+		return false;
+	}
+}
+
+/** Codex RPC children gain slot OAuth without replacing a user's custom route/catalog. */
+export function registerCodexChildProvider(pi: ExtensionAPI, id: string) {
+	let configured: any;
+	try {
+		configured = JSON.parse(readFileSync(MODELS_CONFIG_PATH, "utf8"))?.providers?.[id];
+	} catch {
+		// Pi owns reporting malformed model configuration; absent files use defaults.
+	}
+	const hasRoute = typeof configured?.baseUrl === "string" && configured.baseUrl.trim().length > 0;
+	const hasCatalog = Array.isArray(configured?.models) && configured.models.length > 0 &&
+		configured.models.every((model: any) => typeof model?.id === "string" && model.id.length > 0);
+	if (configured?.apiKey === placeholderKeyFor("codex") && isOwnedCodexChildRoute(configured?.baseUrl, id)) {
+		// Our published proxy only admits its placeholder, never a real OAuth token.
+		// An OAuth-capable child instead owns its selected slot and goes upstream,
+		// avoiding dependence on the parent's loopback proxy lifetime. Retain the
+		// published catalog (including custom/live IDs), rewriting only owned URLs.
+		const models = hasCatalog ? configured.models.map((model: any) => ({
+			...model,
+			...(isOwnedCodexChildRoute(model.baseUrl, id) ? { baseUrl: "https://chatgpt.com/backend-api" } : {}),
+		})) : undefined;
+		registerCodexSlot(pi, id, models, id);
+	} else if (hasRoute && (hasCatalog || id === CODEX_BASE)) {
+		// Legacy registrations can take precedence over models.json. Register auth
+		// only here so a local proxy/catalog is not replaced with upstream defaults.
+		pi.registerProvider(id, { oauth: codexOAuthOverride(id, id) });
+	} else {
+		// Explicit name registers even the base provider without loading parent hooks.
+		registerCodexSlot(pi, id, undefined, id);
+	}
+}
+
 /**
  * Antigravity uses its own Cloud Code Assist transport rather than Pi's native
  * OpenAI/Anthropic transports. Every slot has the same provider definition but
@@ -3652,10 +3703,16 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	// rotation, session hooks, commands or model-selection behavior.
 	pi.events.on("rpc-subagents:provider-source:v1", (data: unknown) => {
 		const request = data as { provider?: string; register?: (path: string) => void };
-		if (request && typeof request.provider === "string" && /^antigravity(?:-account-\d+)?$/.test(request.provider) && typeof request.register === "function") {
+		if (!request || typeof request.provider !== "string" || typeof request.register !== "function") return;
+		if (/^(?:antigravity|openai-codex)(?:-account-\d+)?$/.test(request.provider)) {
 			request.register(fileURLToPath(new URL("./subagent-provider.ts", import.meta.url)));
+		} else if (request.provider === "grok-cli") {
+			// grok-4.7-build-fast is a Grok CLI catalog model, not a Codex service tier.
+			request.register(fileURLToPath(new URL("./grok-cli-provider.ts", import.meta.url)));
 		}
 	});
+	registerGrokProvider(pi);
+	registerFastCommand(pi);
 	// Warm up the OAuth helpers before any provider registration: providers are
 	// registered synchronously below and their `usesCallbackServer`/`getApiKey`
 	// read from the cached module. Deliberately NON-fatal — if pi-ai's oauth entry
@@ -8464,6 +8521,37 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			);
 			return;
 		}
+		if (command === "fast") {
+			const fastArgs = args.trim().split(/\s+/).slice(1);
+			if (fastArgs[0]?.toLowerCase() === "grok") {
+				await handleGrokFast(pi, ctx, fastArgs[1]?.toLowerCase());
+				return;
+			}
+			const action = ((fastArgs[0]?.toLowerCase() === "codex" ? fastArgs[1] : arg1) ?? "status").toLowerCase();
+			if (action !== "on" && action !== "off" && action !== "status") {
+				ctx.ui.notify("Usage: /multi-account fast [codex|grok] on|off|status", "warning");
+				return;
+			}
+			if (action === "on" || action === "off") {
+				try {
+					writeCodexFastEnabled(action === "on");
+				} catch (error) {
+					ctx.ui.notify(
+						`pi-multi-account: could not save Codex fast mode: ${error instanceof Error ? error.message : String(error)}`,
+						"warning",
+					);
+					return;
+				}
+			}
+			const enabled = readCodexFastEnabled();
+			ctx.ui.notify(
+				enabled
+					? "pi-multi-account: Codex fast mode ON. Base provider, account slots and RPC subagents send service_tier=priority. No separate fast-mode plugin is needed."
+					: "pi-multi-account: Codex fast mode OFF. Base provider, account slots and RPC subagents omit service_tier. Disable any separately loaded fast-mode plugin to avoid conflicting hooks.",
+				"info",
+			);
+			return;
+		}
 		if (command === "priority" || command === "order") {
 			const rest = args.trim().split(/\s+/).slice(1).join(" ").trim();
 			const groupsPresent = [
@@ -8740,6 +8828,19 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 					paint("accent", bold(ctx.model ? accountText(ctx.model.provider) : "无")),
 				),
 				field("模型", ctx.model ? ctx.model.id : "无"),
+				...(isCodexFastModel(ctx.model)
+					? [
+							field(
+								"快速",
+								paint(
+									readCodexFastEnabled() ? "success" : "muted",
+									readCodexFastEnabled()
+										? "priority · service_tier"
+										: "standard",
+								),
+							),
+						]
+					: []),
 				field(
 					"轮换",
 					rotation.length
@@ -8884,7 +8985,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				// list below, `switch` was effectively undiscoverable and `next` pressed repeatedly
 				// was the only way anyone found to reach a chosen account.
 				`Switch accounts: /multi-account best — jump straight to an account that can work now · /multi-account switch <provider> — e.g. /multi-account switch ${rotation.find((p) => p !== ctx.model?.provider) ?? rotation[0] ?? "<provider>"} · /multi-account next steps through the rotation in order`,
-				`Other commands: status | best | priority [...] | limits [refresh] | models | log [N|on|off] | only-active [on|off] | rediscover | add [anthropic|codex|kimi|antigravity|cursor|ollama|qwen] | remove [anthropic|codex|kimi|antigravity|cursor|ollama|qwen|<provider-id>] | revive <provider|all> | clear | stop | reset | reload | enable | disable`,
+				`Other commands: status | best | fast [on|off|status] | priority [...] | limits [refresh] | models | log [N|on|off] | only-active [on|off] | rediscover | add [anthropic|codex|kimi|antigravity|cursor|ollama|qwen] | remove [anthropic|codex|kimi|antigravity|cursor|ollama|qwen|<provider-id>] | revive <provider|all> | clear | stop | reset | reload | enable | disable`,
 			].join("\n"),
 			"info",
 		);
@@ -9365,6 +9466,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			if (classifyProvider(provider, config.qwenProvider) === "qwen") {
 				rewriteDeveloperRoleToSystem(payload);
 			}
+			shapeCodexFastPayload(payload, ctx?.model);
 		}
 		return shaped;
 	});

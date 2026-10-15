@@ -46,6 +46,7 @@
   ],
   "files": [
     "index.ts",
+    "subagent-provider.ts",
     "model-catalog.ts",
     "usage.ts",
     "cursor-bridge.ts",
@@ -54,6 +55,10 @@
     "context-guard.ts",
     "provider-priority.ts",
     "child-usability.ts",
+    "codex-fast.ts",
+    "fast-command.ts",
+    "grok-cli-provider.ts",
+    "grok",
     "pi-contract.ts",
     "slot-proxy.ts",
     "antigravity",
