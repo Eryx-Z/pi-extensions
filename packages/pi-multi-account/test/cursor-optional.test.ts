@@ -19,6 +19,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
+import { typescriptNodeArgs } from "./node-typescript.ts";
 
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const EXTENSION_ENTRY = join(REPO_ROOT, "index.ts");
@@ -40,6 +41,7 @@ const mod = await import(process.argv[4]);
 const events = {};
 const notifies = [];
 const pi = {
+	events: { on: () => {} },
 	registerProvider: (id, cfg) => { registeredProviders.push(id); modelCounts[id] = (cfg?.models ?? []).length; },
 	registerCommand: () => {},
 	on: (name, handler) => { events[name] = handler; },
@@ -153,6 +155,7 @@ function runSession(
 		const stdout = execFileSync(
 			process.execPath,
 			[
+				...typescriptNodeArgs,
 				driver,
 				agentDir,
 				cursorRoot,

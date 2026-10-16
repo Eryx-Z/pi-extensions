@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import test from "node:test";
+import { typescriptNodeArgs } from "./node-typescript.ts";
 import multiAccount from "../index.ts";
 import { placeholderKeyFor } from "../slot-proxy.ts";
 
@@ -115,7 +116,7 @@ console.log('child preflight OK');
         baseUrl: configuredUrl, api: "openai-codex-responses", apiKey: ownedKey ? placeholderKeyFor("codex") : "placeholder",
         models: [{ id: modelId, ...(direct ? { baseUrl: configuredUrl, contextWindow: 123456, maxTokens: 1000, reasoning: true, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } } : {}) }],
       } } : {} }));
-      const output = execFileSync(process.execPath, [join(root, "driver.mjs")], {
+      const output = execFileSync(process.execPath, [...typescriptNodeArgs, join(root, "driver.mjs")], {
         encoding: "utf8", env: { ...process.env, PI_OFFLINE: "1", PI_CODING_AGENT_DIR: root,
           PI_RPC_SUBAGENT_CHILD: "1", PI_RPC_SUBAGENT_LOADOUT: join(root, "loadout.json"), TEST_MODELS: join(root, "models.json") },
       });

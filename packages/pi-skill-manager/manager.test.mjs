@@ -12,7 +12,7 @@ import {
   searchSkills,
   setManualOnlyInContent,
   splitCommandLine,
-} from "./manager.mjs";
+} from "./manager.ts";
 
 const SKILL = `---
 name: example-skill

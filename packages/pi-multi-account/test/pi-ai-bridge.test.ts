@@ -18,14 +18,15 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
+import { typescriptNodeArgs } from "./node-typescript.ts";
 
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 // Derived from the published file list rather than hand-maintained: a new root module that
 // index.ts imports but this fixture does not copy fails these tests with a module-not-found
 // that says nothing about the real problem.
-const EXTENSION_SOURCES = (
-	JSON.parse(readFileSync(join(REPO_ROOT, "package.json"), "utf8")).files as string[]
-).filter((file) => file.endsWith(".ts"));
+const EXTENSION_SOURCES = JSON.parse(
+	readFileSync(join(REPO_ROOT, "package.json"), "utf8"),
+).files as string[];
 
 const { piAiRootCandidates } = (await import("../index.ts")) as {
 	piAiRootCandidates: (
@@ -112,14 +113,31 @@ const MODERN_CODEX_PROVIDER = `export function openaiCodexProvider() {
  * ancestor distance — which is what the resolution bug was about — is identical either way,
  * and the exact npm path shape is locked by the `piAiRootCandidates` test below.
  */
-function buildHoistedInstall(era: "legacy" | "modern"): string {
-	const root = mkdtempSync(join(tmpdir(), `pmacct-bridge-${era}-`));
+// Vendored providers require pi-ai's core runtime even when its optional OAuth
+// entry points are absent. These stubs export NO OAuth and fail if accidentally
+// used for inference: this fixture only exercises module loading and OAuth.
+function installCoreRuntime(root: string): string {
 	const piAi = join(root, "node_modules", "@earendil-works", "pi-ai");
 	mkdirSync(join(piAi, "dist", "providers"), { recursive: true });
-	writeFileSync(
-		join(piAi, "package.json"),
-		JSON.stringify({ name: "@earendil-works/pi-ai", version: "0.0.0-test", type: "module" }),
-	);
+	writeFileSync(join(piAi, "package.json"), JSON.stringify({
+		name: "@earendil-works/pi-ai", version: "0.0.0-test", type: "module",
+		exports: { ".": "./index.js", "./compat": "./compat.js" },
+	}));
+	writeFileSync(join(piAi, "index.js"), `
+const unexpected = () => { throw new Error("unexpected inference in OAuth fixture"); };
+export const lazyStream = unexpected;
+export const calculateCost = unexpected;
+export const createAssistantMessageEventStream = unexpected;
+`);
+	writeFileSync(join(piAi, "compat.js"), `
+export function streamSimpleOpenAIResponses() { throw new Error("unexpected inference in OAuth fixture"); }
+`);
+	return piAi;
+}
+
+function buildHoistedInstall(era: "legacy" | "modern"): string {
+	const root = mkdtempSync(join(tmpdir(), `pmacct-bridge-${era}-`));
+	const piAi = installCoreRuntime(root);
 	if (era === "legacy") {
 		writeFileSync(join(piAi, "dist", "oauth.js"), LEGACY_OAUTH_ENTRY);
 	} else {
@@ -131,7 +149,7 @@ function buildHoistedInstall(era: "legacy" | "modern"): string {
 	const ext = join(root, "pkg", "pi-multi-account");
 	mkdirSync(ext, { recursive: true });
 	for (const file of EXTENSION_SOURCES) {
-		cpSync(join(REPO_ROOT, file), join(ext, file));
+		cpSync(join(REPO_ROOT, file), join(ext, file), { recursive: true });
 	}
 	writeFileSync(
 		join(ext, "package.json"),
@@ -150,6 +168,7 @@ process.env.PI_CURSOR_PROVIDER_ROOT = join(process.env.PI_CODING_AGENT_DIR, "no-
 const mod = await import(process.argv[2]);
 const providers = [];
 mod.default({
+	events: { on: () => {} },
 	registerProvider: (name, cfg) => providers.push({ name, cfg }),
 	registerCommand: () => {},
 	on: () => {},
@@ -172,7 +191,7 @@ const result = {
 	codexRefreshed: undefined,
 	loginError: undefined,
 };
-// Login/refresh may legitimately fail when there is no usable pi-ai — the contract is that
+// Login/refresh may legitimately fail when there is no usable pi-ai OAuth — the contract is that
 // they fail HERE, loudly, rather than taking the extension down at load time.
 const login = anthropic?.cfg?.oauth?.login;
 if (typeof login === "function") {
@@ -214,7 +233,7 @@ function loadExtensionIn(root: string): Record<string, any> {
 	writeFileSync(driver, DRIVER);
 	const stdout = execFileSync(
 		process.execPath,
-		[driver, join(root, "pkg", "pi-multi-account", "index.ts")],
+		[...typescriptNodeArgs, driver, join(root, "pkg", "pi-multi-account", "index.ts")],
 		{ cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
 	);
 	const line = stdout.split("\n").find((l) => l.startsWith("__RESULT__"));
@@ -273,13 +292,14 @@ test("hoisted install with pi-ai >= 0.80 (types-only dist/oauth.js): extension l
 	}
 });
 
-test("no pi-ai at all: the extension still loads instead of dying at startup", () => {
+test("pi-ai core without OAuth entries: the extension still loads instead of dying at startup", () => {
 	const root = mkdtempSync(join(tmpdir(), "pmacct-bridge-none-"));
 	try {
+		installCoreRuntime(root);
 		const ext = join(root, "pkg", "pi-multi-account");
 		mkdirSync(ext, { recursive: true });
 		for (const file of EXTENSION_SOURCES) {
-			cpSync(join(REPO_ROOT, file), join(ext, file));
+			cpSync(join(REPO_ROOT, file), join(ext, file), { recursive: true });
 		}
 		writeFileSync(
 			join(ext, "package.json"),

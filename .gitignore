@@ -1,4 +1,6 @@
 node_modules/
+# Workspace installs use the root lockfile.
+/packages/*/package-lock.json
 .DS_Store
 *.log
 npm-debug.log*

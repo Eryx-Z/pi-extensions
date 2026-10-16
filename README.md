@@ -10,11 +10,10 @@
 | :--- | :---: | :--- |
 | [`pi-skill-manager`](./packages/pi-skill-manager) | `1.0.0` | Batch-manage automatic Skill invocation (`disable-model-invocation`), interactive TUI, `$` search & custom groups |
 | [`pi-status-hub`](./packages/pi-status-hub) | `0.1.0` | Unified status line orchestrator for Pi, eliminating footer collisions, with adaptive 3-stage folding & `/shub` UI |
-| [`model-aware-autocompact`](./packages/model-aware-autocompact) | `1.0.0` | Context-window-aware automatic compaction with per-model percentage thresholds |
+| [`model-aware-autocompact`](./packages/model-aware-autocompact) | `1.0.0` | Automatic compaction with per-model thresholds and cached summaries of old tool output |
 | [`pi-multi-account`](./packages/pi-multi-account) | `1.20.0` | Automatic multi-account failover & rotation across Claude, Codex, Antigravity, Kimi, Cursor, Qwen, Ollama |
 | [`pi-token-usage`](./packages/pi-token-usage) | `0.1.0` | Local session token usage and cost visualization panel (`/usage`) |
 | [`pi-open-terminal`](./packages/pi-open-terminal) | `1.0.0` | Quick Kitty terminal launcher in current working directory via `/d` |
-| [`pi-sync`](./packages/pi-sync) | `0.49.15` | Deterministic configuration & skill synchronization through private Git repositories |
 
 ---
 
@@ -65,11 +64,17 @@ Clone this repository and point Pi to your local checkout in `~/.pi/agent/settin
 
 ## 🛠️ Development
 
-This project uses npm workspaces with Node 22+.
+This project uses npm workspaces with Node 22.19+ and one root `package-lock.json`.
+Run dependency installation from the repository root, not from individual packages.
+All six workspaces must provide `test` and `typecheck` scripts; missing scripts fail
+the root checks rather than being silently skipped. Tests use Node's test runner
+with `tsx` to load TypeScript; all workspaces use the same TypeScript version range.
+The GitHub Actions workflow runs these checks on Node 22 and 24, plus the
+`pi-multi-account` package-content check.
 
 ```bash
-# Install all dependencies across packages
-npm install
+# Reproduce the locked dependencies across all workspaces
+npm ci
 
 # Run build across all workspaces
 npm run build
@@ -79,6 +84,9 @@ npm run typecheck
 
 # Run test suites
 npm run test
+
+# Run both required gates
+npm run check
 ```
 
 ---
@@ -86,7 +94,6 @@ npm run test
 ## 💖 Acknowledgments
 
 - **`pi-multi-account`**: Enhanced and customized with Google Antigravity failover & quota rotation, based on foundational work by [@Sarrius](https://github.com/Sarrius/pi-multi-account).
-- **`pi-sync`**: Streamlined and refactored into single-target private Git sync, adapted from earlier work by [@narumiruna](https://github.com/narumiruna/pi-extensions).
 
 ---
 

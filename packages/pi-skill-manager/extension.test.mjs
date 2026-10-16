@@ -3,8 +3,8 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import skillManagerExtension from "./extension.mjs";
-import { getManualOnlyFromContent } from "./manager.mjs";
+import skillManagerExtension from "./extension.ts";
+import { getManualOnlyFromContent } from "./manager.ts";
 
 const SKILL = `---
 name: alpha

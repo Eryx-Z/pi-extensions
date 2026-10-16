@@ -4,7 +4,7 @@ import { spawn } from "node:child_process";
 export default function (pi: ExtensionAPI) {
 	pi.registerCommand("d", {
 		description: "在 Pi 当前工作目录打开一个新的 Kitty 终端",
-		handler: (_args, ctx) => {
+		handler: async (_args, ctx) => {
 			if (ctx.mode !== "tui") {
 				if (ctx.hasUI) ctx.ui.notify("/d 只能在 TUI 模式中使用", "warning");
 				return;

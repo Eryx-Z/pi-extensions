@@ -1,7 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { readFileSync } from "node:fs";
 import { applyCodexFastMode, isCodexFastModel, readCodexFastEnabled } from "./codex-fast.ts";
-import { registerAntigravitySlot, registerCodexChildProvider } from "./index.ts";
+import { registerAntigravitySlot, registerCodexChildProvider } from "./provider-slots.ts";
 
 /** Provider-only RPC startup: no tools, account rotation, model restore or UI hooks. */
 export default function subagentProvider(pi: ExtensionAPI) {

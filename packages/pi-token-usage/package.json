@@ -9,7 +9,7 @@
     "pi-coding-agent"
   ],
   "scripts": {
-    "test": "tsx --test test/**/*.test.ts",
+    "test": "node --import tsx --test test/**/*.test.ts",
     "typecheck": "tsc --noEmit",
     "check": "npm run typecheck && npm test"
   },
@@ -27,6 +27,6 @@
     "@earendil-works/pi-tui": "^0.84.4",
     "@types/node": "^22.0.0",
     "tsx": "^4.20.0",
-    "typescript": "^5.7.0"
+    "typescript": "^6.0.3"
   }
 }

@@ -5,7 +5,8 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 const VENDORED_CURSOR_ROOT = join(dirname(fileURLToPath(import.meta.url)), "cursor");
 
-export const CURSOR_BASE = "cursor";
+import { CURSOR_BASE } from "./provider-ids.ts";
+export { CURSOR_BASE, isCursorProviderId } from "./provider-ids.ts";
 
 /**
  * The one bearer value the vendored proxy treats as "no usable token on this request",
@@ -19,10 +20,6 @@ export const CURSOR_BASE = "cursor";
  * string, publishing it would silently send a bogus token instead.
  */
 export const CURSOR_PROXY_PLACEHOLDER_KEY = "cursor-proxy";
-
-export function isCursorProviderId(id: string): boolean {
-	return id === CURSOR_BASE || /^cursor-account-\d+$/.test(id);
-}
 
 /**
  * Where Cursor implementation is loaded from.

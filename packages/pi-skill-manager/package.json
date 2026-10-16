@@ -11,7 +11,13 @@
     "skill-manager"
   ],
   "scripts": {
-    "test": "node --test *.test.mjs"
+    "test": "node --import tsx --test *.test.mjs",
+    "typecheck": "tsc --project tsconfig.json"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.1",
+    "tsx": "^4.20.0",
+    "typescript": "^6.0.3"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*"

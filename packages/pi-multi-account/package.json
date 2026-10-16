@@ -47,12 +47,22 @@
   "files": [
     "index.ts",
     "subagent-provider.ts",
+    "agent-paths.ts",
+    "pi-ai-bridge.ts",
+    "auth-state.ts",
+    "provider-ids.ts",
+    "account-display.ts",
+    "provider-slots.ts",
+    "failover-config.ts",
+    "failover-state.ts",
+    "request-shaping.ts",
+    "interrupted-turns.ts",
+    "cooldown.ts",
+    "pi-files.ts",
     "model-catalog.ts",
     "usage.ts",
     "cursor-bridge.ts",
     "cursor-model-name.ts",
-    "compaction-summary.ts",
-    "context-guard.ts",
     "provider-priority.ts",
     "child-usability.ts",
     "codex-fast.ts",
@@ -71,8 +81,9 @@
     "CONTRIBUTING.md"
   ],
   "scripts": {
-    "check": "tsc --noEmit",
-    "test": "node --test test/*.test.ts",
+    "check": "npm run typecheck",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test test/*.test.ts",
     "pack:check": "node scripts/check-package.mjs",
     "release:check": "npm run check && npm test && npm run pack:check",
     "prepublishOnly": "npm run release:check"
@@ -89,6 +100,7 @@
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "^0.85.1",
     "@types/node": "^22.20.1",
+    "tsx": "^4.20.0",
     "typescript": "^6.0.3"
   },
   "pi": {

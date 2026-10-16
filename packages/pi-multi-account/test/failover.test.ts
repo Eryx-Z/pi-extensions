@@ -19,6 +19,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
+import { CLAUDE_CODE_VERSION } from "../request-shaping.ts";
 
 const AGENT_DIR = mkdtempSync(join(tmpdir(), "pmacct-test-"));
 process.env.PI_CODING_AGENT_DIR = AGENT_DIR;
@@ -231,19 +232,13 @@ function setup(opts: {
 		| { status: "terminal"; error: string }
 		| { status: "transient"; error: string }
 	>;
-	compactionAuth?: {
-		ok: boolean;
-		error?: string;
-		apiKey?: string;
-		headers?: Record<string, string>;
-	};
-	compactFn?: (...args: any[]) => Promise<any>;
 	contextUsage?: {
 		tokens: number | null;
 		contextWindow: number;
 		percent: number | null;
 	};
 	continueThrows?: string;
+	appendEntryThrows?: string;
 	continueBlocks?: () => Promise<void>;
 	/** Deterministic provider response used by status; prevents unit tests from reaching the network. */
 	statusFetch?: typeof fetch;
@@ -325,7 +320,7 @@ function setup(opts: {
 		statuses: [] as Array<{ key: string; value: string | undefined }>,
 		compacts: [] as Array<Record<string, unknown>>,
 		customMessages: [] as Array<{ message: any; options?: any }>,
-		compactionAuthFor: [] as string[],
+		authRequests: [] as string[],
 		thinkingLevels: [] as string[],
 		registrations: [] as Array<{ provider: string; models: number | undefined }>,
 		unregistrations: [] as string[],
@@ -367,8 +362,7 @@ function setup(opts: {
 			? mkModel(opts.current.provider, opts.current.id)
 			: undefined,
 		isIdle: () => idle,
-		// The host's ctx.compact(): fire-and-forget, resolves through the callbacks. The guard calls
-		// this only at a settled boundary, because the real one begins with an abort().
+		// Record any accidental request to compact: this extension must never own that lifecycle.
 		compact: (options?: {
 			onComplete?: (r: unknown) => void;
 			onError?: (e: Error) => void;
@@ -458,10 +452,8 @@ function setup(opts: {
 				configured: known.has(provider),
 			}),
 			getApiKeyAndHeaders: async (model: { provider: string; id: string }) => {
-				rec.compactionAuthFor.push(`${model.provider}/${model.id}`);
-				return (
-					opts.compactionAuth ?? { ok: false as const, error: "no key in test" }
-				);
+				rec.authRequests.push(`${model.provider}/${model.id}`);
+				return { ok: false as const, error: "no key in test" };
 			},
 		},
 		getContextUsage: () => opts.contextUsage,
@@ -535,7 +527,9 @@ function setup(opts: {
 			if (opts.continueThrows) throw new Error(opts.continueThrows);
 			if (opts.continueBlocks) await opts.continueBlocks();
 		},
-		appendEntry: () => {},
+		appendEntry: () => {
+			if (opts.appendEntryThrows) throw new Error(opts.appendEntryThrows);
+		},
 		getThinkingLevel: () => sessionThinkingLevel,
 		setThinkingLevel: (level: string) => {
 			rec.thinkingLevels.push(level); // what the extension ASKED for
@@ -549,8 +543,6 @@ function setup(opts: {
 	// Simulate a host with no prompt-injection fallback either — the worst case, where the extension
 	// can still switch accounts but cannot auto-continue at all.
 	if (opts.omitSendUserMessage) delete pi.sendUserMessage;
-	// Tests always take this hook so they never import the real compact() (network).
-	(pi as any).__testCompactFn = opts.compactFn;
 
 	piMultiAccount(pi);
 
@@ -1153,6 +1145,23 @@ test("same Codex accountId in two slots is one rotation account and shares coold
 		state.exhaustedUntilByProvider?.["openai-codex-account-3"],
 		"all slots for the real account share cooldown",
 	);
+	assert.equal(Object.hasOwn(state, "lastProbeAtByProvider"), false, "write-only probe metadata is not generated");
+	assert.equal(state.lastSwitches[0].to, "openai-codex-account-2/gpt-5.5");
+	assert.deepEqual(state.lastUserModel, { provider: "openai-codex-account-2", id: "gpt-5.5" });
+});
+
+test("a host switch-log failure cannot lose already-recorded cooldowns or the selected model", async () => {
+	const t = setup({
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		config: { autoContinue: false },
+		appendEntryThrows: "host session log is unavailable",
+	});
+	await finishError(t, "anthropic", "claude-opus-4-8", "429 usage limit reached");
+	const state = t.readState();
+	assert.ok(state.exhaustedUntilByProvider?.anthropic > Date.now());
+	assert.deepEqual(state.lastUserModel, { provider: "openai-codex-account-2", id: "gpt-5.5" });
+	assert.equal((state.lastSwitches ?? []).length, 0, "the failing switch log must not be committed as successful");
+	assert.ok(t.rec.notifies.some((notice) => notice.includes("host session log is unavailable")));
 });
 
 test("different Team members sharing one Codex accountId remain separate rotation accounts", async () => {
@@ -1560,7 +1569,7 @@ test("Qwen shows live availability / rate-limit status (it has no quota API)", a
 		current: { provider: "alibaba", id: "qwen3.7-max" },
 	});
 	await t.fire("session_start");
-	await t.command("status");
+	await t.command("status full");
 	assert.ok(
 		t.rec.notifies.some((m) => m.includes("Qwen/Alibaba | available")),
 		`available before any limit; notifies=${t.rec.notifies.join(" | ")}`,
@@ -1570,7 +1579,7 @@ test("Qwen shows live availability / rate-limit status (it has no quota API)", a
 	await finishError(t, "alibaba", "qwen3.7-max", "usage limit reached");
 	t.setCurrent("alibaba", "qwen3.7-max");
 	t.rec.notifies.length = 0;
-	await t.command("status");
+	await t.command("status full");
 	assert.ok(
 		t.rec.notifies.some((m) => /Qwen\/Alibaba \| rate-limited/.test(m)),
 		`rate-limited after a 429; notifies=${t.rec.notifies.join(" | ")}`,
@@ -1932,7 +1941,7 @@ test("all-limited work resumes in the same live session after cooldown", async (
 	const t = setup({
 		accounts: ONE_ACCOUNT,
 		current: { provider: "anthropic", id: "claude-opus-4-8" },
-		config: { cooldownMs: 1000, probeCooldownMs: 1000 },
+		config: { cooldownMs: 1000 },
 	});
 	await finishError(t, "anthropic", "claude-opus-4-8", "429 rate limit");
 	assert.equal(t.rec.sent.length, 0, "nothing is available immediately");
@@ -2586,12 +2595,8 @@ test("OAuth-marked Anthropic payload gets one billing header", () => {
 	};
 	const once = t.beforeReq(payload) as any;
 	assert.match(once.system[0].text, /^x-anthropic-billing-header:/);
-	// Pinned to the constant in index.ts, never a literal: the weekly version-check workflow bumps
-	// that constant, and a hardcoded copy here would turn every automated bump into a red CI run.
-	const expectedCcVersion = readFileSync(
-		new URL("../index.ts", import.meta.url),
-		"utf8",
-	).match(/CLAUDE_CODE_VERSION = "([^"]+)"/)![1]!;
+	// The integration hook must use the version owned by the request shaper, not a duplicated literal.
+	const expectedCcVersion = CLAUDE_CODE_VERSION;
 	assert.ok(
 		once.system[0].text.includes(`cc_version=${expectedCcVersion}.`),
 		`billing header must carry CLAUDE_CODE_VERSION (${expectedCcVersion}), got: ${once.system[0].text}`,
@@ -3584,7 +3589,7 @@ test("pending resume after auth failure does not rotate back to the same provide
 });
 
 // ---------------------------------------------------------------------------
-// v1.12.0 robustness: no spurious resume, account-aware compaction, watchdog
+// v1.12.0 robustness: no spurious resume, watchdog
 // ---------------------------------------------------------------------------
 
 function okAssistant(provider: string, model: string) {
@@ -3931,322 +3936,51 @@ test("startup capability preflight: a fully-capable host raises NO capability no
 	);
 });
 
-test("session_before_compact: leaves Pi's default compaction alone when the active account is healthy", async () => {
-	const t = setup({
-		current: { provider: "anthropic", id: "claude-opus-4-8" },
-	});
-	const result = await t.fire("session_before_compact", {
-		reason: "threshold",
-		preparation: {
-			messagesToSummarize: [],
-			firstKeptEntryId: "e1",
-			tokensBefore: 1000,
-		},
-		signal: { aborted: false },
-	});
-	assert.equal(result, undefined, "healthy account → Pi's default compaction");
-	assert.ok(
-		t.rec.compactionAuthFor.some((m) => m.startsWith("anthropic/")),
-		"the current healthy account is the one considered for the summary",
-	);
+test("external compaction is not intercepted even when the active account is unavailable", async () => {
+	const scenarios: Array<Record<string, number>> = [
+		{},
+		{ anthropic: 60_000 },
+		{ anthropic: 60_000, "openai-codex-account-2": 60_000 },
+	];
+	for (const cooldowns of scenarios) {
+		const t = setup({
+			current: { provider: "anthropic", id: "claude-opus-4-8" },
+			seedCooldownsMsFromNow: cooldowns,
+			config: { routeCompactionToHealthyAccount: true, compactionWatchdogMs: 1 },
+		});
+		for (const reason of ["threshold", "overflow", "manual"]) {
+			const result = await t.fire("session_before_compact", {
+				reason,
+				preparation: { messagesToSummarize: [], firstKeptEntryId: "e1", tokensBefore: 1000 },
+				signal: { aborted: false },
+			});
+			assert.equal(result, undefined, "only Pi or its compaction extension may summarize or cancel");
+		}
+		assert.deepEqual(t.rec.authRequests, [], "no account is probed for a summary");
+		assert.deepEqual(t.rec.setModels, [], "external compaction must not change accounts");
+		assert.deepEqual(t.rec.compacts, []);
+		assert.deepEqual(t.rec.notifies, []);
+	}
 });
 
-test("session_before_compact: a healthy current account is compacted with a time bound, not Pi's untimed default", async () => {
-	const tried: string[] = [];
-	const t = setup({
-		current: { provider: "anthropic", id: "claude-opus-4-8" },
-		compactionAuth: { ok: true, apiKey: "test-key" },
-		compactFn: async (_p, model) => {
-			tried.push(model.provider);
-			return COMPACTION_SUMMARY;
-		},
-	});
-	const result = await t.fire("session_before_compact", {
-		reason: "threshold",
-		preparation: {
-			messagesToSummarize: [],
-			firstKeptEntryId: "e1",
-			tokensBefore: 1000,
-		},
-		signal: { aborted: false },
-	});
-	assert.equal(result?.compaction?.summary, COMPACTION_SUMMARY.summary);
-	assert.deepEqual(
-		tried,
-		["anthropic"],
-		"compacts on the current account; no reroute",
-	);
-	assert.ok(
-		!t.rec.notifies.some((n) => /summarizing on/i.test(n)),
-		"no 'summarizing on X instead' toast when the current account itself is live",
-	);
-});
-
-test("session_before_compact: a timed-out compact on the current healthy account is aborted and the next live account is tried", async () => {
-	const tried: string[] = [];
-	let abortedCurrent = false;
-	const t = setup({
-		current: { provider: "anthropic", id: "claude-opus-4-8" },
-		compactionAuth: { ok: true, apiKey: "test-key" },
-		config: { compactionWatchdogMs: 40 },
-		compactFn: (preparation, model, apiKey, headers, instructions, signal) => {
-			tried.push(model.provider);
-			if (model.provider === "anthropic") {
-				return hangingCompact(() => {
-					abortedCurrent = true;
-				})(preparation, model, apiKey, headers, instructions, signal);
-			}
-			return Promise.resolve(COMPACTION_SUMMARY);
-		},
-	});
-	const result = await t.fire("session_before_compact", {
-		reason: "manual",
-		preparation: {
-			messagesToSummarize: [],
-			firstKeptEntryId: "e1",
-			tokensBefore: 250000,
-		},
-		signal: { aborted: false },
-	});
-	assert.equal(abortedCurrent, true, "the wedged current compact is aborted");
-	assert.ok(tried.includes("anthropic"));
-	assert.ok(
-		tried.includes("openai-codex-account-2"),
-		`next live account is tried after the current one times out; got: ${tried.join(", ")}`,
-	);
-	assert.equal(result?.compaction?.summary, COMPACTION_SUMMARY.summary);
-});
-
-test("session_before_compact: routes the summary to a healthy account when the active account is cooling", async () => {
-	const t = setup({
-		current: { provider: "openai-codex-account-2", id: "gpt-5.5" },
-		// The active codex account is itself spent — Pi's default would try to summarize on it.
-		seedCooldownsMsFromNow: { "openai-codex-account-2": 60 * 60 * 1000 },
-		// ok:false stops the handler before the real compact() call (no network in unit tests),
-		// while still proving WHICH account it chose to summarize on.
-		compactionAuth: { ok: false },
-	});
-	const result = await t.fire("session_before_compact", {
-		reason: "overflow",
-		preparation: {
-			messagesToSummarize: [],
-			firstKeptEntryId: "e1",
-			tokensBefore: 250000,
-		},
-		signal: { aborted: false },
-	});
-	assert.ok(
-		t.rec.compactionAuthFor.some((m) => m.startsWith("anthropic/")),
-		"compaction is routed to the healthy anthropic account, not the cooling codex one",
-	);
-	assert.ok(
-		!t.rec.compactionAuthFor.some((m) => m.startsWith("openai-codex-account-2/")),
-		"the cooling account is never chosen to summarize",
-	);
-	assert.equal(
-		result?.cancel,
-		true,
-		"auth unavailable → cancel, never Pi default on the spent account",
-	);
-});
-
-test("session_before_compact: cancels instead of hanging on Pi default when no account is available", async () => {
+test("queued user input does not cancel external compaction and passively flushes when it ends", async () => {
 	const t = setup({
 		accounts: ONE_ACCOUNT,
 		current: { provider: "anthropic", id: "claude-opus-4-8" },
-		seedCooldownsMsFromNow: { anthropic: 60 * 60 * 1000 },
+		seedCooldownsMsFromNow: { anthropic: 60_000 },
+		config: { routeCompactionToHealthyAccount: false },
 	});
-	const result = await t.fire("session_before_compact", {
-		reason: "overflow",
-		preparation: {
-			messagesToSummarize: [],
-			firstKeptEntryId: "e1",
-			tokensBefore: 250000,
-		},
-		signal: { aborted: false },
-	});
-	assert.equal(
-		result?.cancel,
-		true,
-		"no live account → cancel (Pi default on the spent account is the hang)",
-	);
-	assert.equal(
-		t.rec.compactionAuthFor.length,
-		0,
-		"no reroute attempted when nothing is healthy",
-	);
-});
-
-const COMPACTION_SUMMARY = {
-	summary: "the conversation so far",
-	firstKeptEntryId: "e1",
-	tokensBefore: 250000,
-};
-
-function hangingCompact(onAbort: () => void) {
-	return (
-		_preparation: unknown,
-		_model: unknown,
-		_apiKey: unknown,
-		_headers: unknown,
-		_instructions: unknown,
-		signal?: AbortSignal,
-	) =>
-		new Promise((_, reject) => {
-			const fail = () => {
-				onAbort();
-				const err = new Error("aborted");
-				err.name = "AbortError";
-				reject(err);
-			};
-			if (signal?.aborted) {
-				fail();
-				return;
-			}
-			signal?.addEventListener?.("abort", fail, { once: true });
-		});
-}
-
-test("session_before_compact: returns the summary from a live account", async () => {
-	const t = setup({
-		current: { provider: "openai-codex-account-2", id: "gpt-5.5" },
-		seedCooldownsMsFromNow: { "openai-codex-account-2": 60 * 60 * 1000 },
-		compactionAuth: { ok: true, apiKey: "test-key" },
-		compactFn: async () => COMPACTION_SUMMARY,
-	});
-	const result = await t.fire("session_before_compact", {
-		reason: "manual",
-		preparation: {
-			messagesToSummarize: [],
-			firstKeptEntryId: "e1",
-			tokensBefore: 250000,
-		},
-		signal: { aborted: false },
-	});
-	assert.equal(result?.compaction?.summary, COMPACTION_SUMMARY.summary);
-	assert.ok(
-		t.rec.compactionAuthFor.some((m) => m.startsWith("anthropic/")),
-		"summary is generated on the live anthropic account",
-	);
-});
-
-test("session_before_compact: a timed-out live summary is aborted and cancelled — never handed to the spent account", async () => {
-	let aborted = false;
-	const t = setup({
-		current: { provider: "openai-codex-account-2", id: "gpt-5.5" },
-		seedCooldownsMsFromNow: { "openai-codex-account-2": 60 * 60 * 1000 },
-		compactionAuth: { ok: true, apiKey: "test-key" },
-		config: { compactionWatchdogMs: 40 },
-		compactFn: hangingCompact(() => {
-			aborted = true;
-		}),
-	});
-	const result = await t.fire("session_before_compact", {
-		reason: "manual",
-		preparation: {
-			messagesToSummarize: [],
-			firstKeptEntryId: "e1",
-			tokensBefore: 250000,
-		},
-		signal: { aborted: false },
-	});
-	assert.equal(
-		result?.cancel,
-		true,
-		"timeout cancels instead of falling through to the spent Codex account",
-	);
-	assert.equal(
-		result?.compaction,
-		undefined,
-		"no fake summary is returned after a timeout",
-	);
-	assert.equal(
-		aborted,
-		true,
-		"the timed-out compact() call is aborted, not leaked",
-	);
-	assert.ok(
-		t.rec.notifies.some((n) => /cancelled instead of hanging/i.test(n)),
-		"the user is told the spinner will stop, not that Pi default will take over",
-	);
-});
-
-test("session_before_compact: Escape cancels immediately instead of starting Pi default on the spent account", async () => {
-	const signal = new AbortController();
-	signal.abort();
-	const t = setup({
-		current: { provider: "openai-codex-account-2", id: "gpt-5.5" },
-		seedCooldownsMsFromNow: { "openai-codex-account-2": 60 * 60 * 1000 },
-		compactionAuth: { ok: true, apiKey: "test-key" },
-		compactFn: async () => {
-			throw new Error("compact must not run after abort");
-		},
-	});
-	const result = await t.fire("session_before_compact", {
-		reason: "manual",
-		preparation: {
-			messagesToSummarize: [],
-			firstKeptEntryId: "e1",
-			tokensBefore: 250000,
-		},
-		signal: signal.signal,
-	});
-	assert.equal(result?.cancel, true);
-	assert.equal(
-		t.rec.compactionAuthFor.length,
-		0,
-		"an already-aborted compact never resolves auth or starts a summary",
-	);
-});
-
-test("session_before_compact: a timeout on the first live account tries the next one", async () => {
-	const tried: string[] = [];
-	let abortedFirst = false;
-	const t = setup({
-		accounts: {
-			anthropic: { type: "oauth", access: "a-tok-1", refresh: "a-ref-1" },
-			"anthropic-account-2": {
-				type: "oauth",
-				access: "a-tok-2",
-				refresh: "a-ref-2",
-			},
-			"openai-codex-account-2": {
-				type: "oauth",
-				access: "c-tok-2",
-				refresh: "c-ref-2",
-				accountId: "codex-2",
-			},
-		},
-		current: { provider: "openai-codex-account-2", id: "gpt-5.5" },
-		seedCooldownsMsFromNow: { "openai-codex-account-2": 60 * 60 * 1000 },
-		compactionAuth: { ok: true, apiKey: "test-key" },
-		config: { compactionWatchdogMs: 40 },
-		compactFn: (preparation, model, apiKey, headers, instructions, signal) => {
-			tried.push(model.provider);
-			if (model.provider === "anthropic") {
-				return hangingCompact(() => {
-					abortedFirst = true;
-				})(preparation, model, apiKey, headers, instructions, signal);
-			}
-			return Promise.resolve(COMPACTION_SUMMARY);
-		},
-	});
-	const result = await t.fire("session_before_compact", {
-		reason: "overflow",
-		preparation: {
-			messagesToSummarize: [],
-			firstKeptEntryId: "e1",
-			tokensBefore: 250000,
-		},
-		signal: { aborted: false },
-	});
-	assert.ok(tried.includes("anthropic"), "the first live account is tried");
-	assert.equal(abortedFirst, true, "the timed-out first attempt is aborted");
-	assert.ok(
-		tried.includes("anthropic-account-2"),
-		`the next live account is tried after the timeout; got: ${tried.join(", ")}`,
-	);
-	assert.equal(result?.compaction?.summary, COMPACTION_SUMMARY.summary);
+	assert.deepEqual(await t.input("keep this task"), { action: "handled" });
+	assert.equal(t.rec.sent.length, 0, "input is waiting for an account, not lost");
+	assert.equal(await t.fire("session_before_compact", { reason: "threshold" }), undefined,
+		"even a nonempty failover queue must not cancel another owner's compaction");
+	await t.command("revive anthropic");
+	await t.fire("compaction_end", { cancelled: false });
+	await wait(20); // the passive queue flush runs in the background
+	assert.deepEqual(t.rec.sent.map((entry) => entry.prompt), ["keep this task"]);
+	assert.deepEqual(t.rec.compacts, []);
+	assert.deepEqual(t.rec.customMessages, [], "only actual queued user input is delivered");
+	await t.fire("session_shutdown");
 });
 
 test("the wait-for-idle before a resume is bounded — never an infinite busy-loop", async () => {
@@ -4437,7 +4171,7 @@ test("the breaker resets on a genuine new user prompt so auto-continue is restor
 	}
 	// A real user message is a clean slate — it must clear the failure streak.
 	await t.input("ok continue please");
-	const status = await t.command("status");
+	const status = await t.command("status full");
 	void status;
 	assert.ok(
 		t.rec.notifies.some((n) => /Auto-continue breaker: closed/i.test(n)),
@@ -6558,7 +6292,7 @@ test("a provider Pi has no models for is marked unconfigured instead of looking 
 		unknownProviders: ["zai"],
 	});
 	await t.fire("session_start");
-	await t.command("status");
+	await t.command("status full");
 
 	const said = t.rec.notifies.join("\n");
 	assert.match(
@@ -6963,7 +6697,7 @@ test("a managed family missing from a saved providerOrder still joins the rotati
 		},
 	});
 	await t.fire("session_start");
-	await t.command("status");
+	await t.command("status full");
 
 	const said = t.rec.notifies.join("\n");
 	const rotation = /Rotation \(\d+\): ([^\n]*)/.exec(said)?.[1] ?? "";
@@ -7806,12 +7540,7 @@ test("the published placeholder is the one the vendored proxy actually accepts",
 });
 
 // ---------------------------------------------------------------------------
-// Mid-run context guard — wiring
-//
-// context-guard.test.ts proves the accounting and the elision. These prove the extension
-// actually reaches them: the guard has to fire from inside the `context` hook (the only hook Pi
-// runs before EVERY LLM call, including the hundreds inside one autonomous run) and it has to ask
-// for a real summary only once the agent has settled.
+// Request trimming belongs to model-aware-autocompact, not account failover.
 // ---------------------------------------------------------------------------
 
 /** A conversation shaped like the real 78-minute run: mostly large tool results. */
@@ -7851,359 +7580,61 @@ function bigConversation(turns: number) {
 	return messages;
 }
 
-test("the context guard trims a mid-run request instead of letting it overflow", async () => {
-	const t = setup({ current: { provider: "openai-codex", id: "gpt-5.6-sol" } });
-	t.ctx.model.contextWindow = 272_000;
-	t.ctx.getSystemPrompt = () => "s".repeat(24_000);
-
-	// ~250 000 tokens of tool results: past the soft line, and the point at which Pi itself would
-	// still be doing nothing at all because the run has not ended.
-	const messages = bigConversation(50);
-	const result = await t.fire("context", { messages });
-
-	assert.ok(result?.messages, "the guard must rewrite the outgoing request");
-	assert.equal(
-		result.messages.length,
-		messages.length,
-		"no message may be dropped",
-	);
-	const stubbed = result.messages.filter(
-		(m: any) =>
-			m.role === "toolResult" &&
-			String(m.content?.[0]?.text ?? "").includes("context-guard"),
-	);
-	assert.ok(
-		stubbed.length > 0,
-		"old tool output must be left out of the request",
-	);
-	// The tail the agent is actively working in stays verbatim.
-	const last = result.messages[result.messages.length - 1];
-	assert.equal(String(last.content[0].text).includes("context-guard"), false);
-	// And the transcript Pi holds is untouched — we only shape what goes over the wire.
-	assert.equal(messages[2].content[0].text.length, 20_000);
-});
-
-test("the context guard asks for a real summary only once the agent has settled", async () => {
-	const t = setup({ current: { provider: "openai-codex", id: "gpt-5.6-sol" } });
-	t.ctx.model.contextWindow = 272_000;
-	t.ctx.getSystemPrompt = () => "";
-
-	await t.fire("context", { messages: bigConversation(50) });
-	// Mid-run: nothing may call compact(), because the real one starts with an abort() and would
-	// throw away the work the agent is in the middle of.
-	t.setIdle(false);
-	await t.fire("agent_settled", {});
-	assert.equal(
-		t.rec.compacts.length,
-		0,
-		"compaction must never be triggered mid-run",
-	);
-
-	t.setIdle(true);
-	await t.fire("agent_settled", {});
-	assert.equal(
-		t.rec.compacts.length,
-		1,
-		"a settled boundary is where the summary belongs",
-	);
-
-	// A compaction rebuilds the message list, so every elision key now points at history that is
-	// no longer in the request. If the guard kept them, the next small request would come back
-	// stubbed for no reason — and the prompt cache would be thrown away with it.
-	await t.fire("session_compact", {});
-	// 20 turns: comfortably under the soft line, but long enough that part of it sits outside the
-	// protected tail — so a stale elision key would visibly stub it.
-	const afterCompaction = await t.fire("context", {
-		messages: bigConversation(20),
-	});
-	assert.equal(
-		afterCompaction,
-		undefined,
-		"stale elisions must not survive a summary",
-	);
-	t.setIdle(true);
-	await t.fire("agent_settled", {});
-	assert.equal(
-		t.rec.compacts.length,
-		1,
-		"and it must not immediately ask again",
-	);
-});
-
-test("the context guard stands down when the model's window is unknown", async () => {
-	const t = setup({ current: { provider: "openai-codex", id: "gpt-5.6-sol" } });
-	// mkModel deliberately has no contextWindow: with no window there is no basis for a decision.
-	const messages = bigConversation(50);
-	const result = await t.fire("context", { messages });
-	assert.equal(result, undefined, "no window ⇒ no opinion, never a guess");
-	t.setIdle(true);
-	await t.fire("agent_settled", {});
-	assert.equal(t.rec.compacts.length, 0);
-});
-
-test("the context guard leaves an ordinary conversation completely alone", async () => {
-	const t = setup({ current: { provider: "openai-codex", id: "gpt-5.6-sol" } });
-	t.ctx.model.contextWindow = 272_000;
-	t.ctx.getSystemPrompt = () => "s".repeat(24_000);
-	const result = await t.fire("context", { messages: bigConversation(2) });
-	assert.equal(result, undefined);
-	t.setIdle(true);
-	await t.fire("agent_settled", {});
-	assert.equal(t.rec.compacts.length, 0);
-});
-
-// The guard lives entirely in this extension, so a Pi update cannot delete it — but it CAN stop
-// calling it. Every handler here is crash-isolated, so a removed hook does not fail loudly: the
-// guard just never runs again. These lock the detection of that silent death.
-
-test("the context guard reports itself when the host stops calling the pre-request hook", async () => {
-	const t = setup({ current: { provider: "openai-codex", id: "gpt-5.6-sol" } });
-	t.ctx.model.contextWindow = 272_000;
-	const usage = {
-		input: 100,
-		output: 10,
-		cacheRead: 0,
-		cacheWrite: 0,
-		totalTokens: 110,
-	};
-	// Six LLM responses and not one `context` event: the hook the guard hangs off is gone.
-	for (let i = 0; i < 6; i++) {
-		await t.fire("message_end", {
-			message: {
-				role: "assistant",
-				provider: "openai-codex",
-				model: "gpt-5.6-sol",
-				stopReason: "stop",
-				timestamp: 5000 + i,
-				content: [{ type: "text", text: "ok" }],
-				usage,
-			},
+for (const contextGuard of [undefined, true, false, { softPercent: 0.01, targetPercent: 0.005 }]) {
+	test("multi-account never trims requests, including legacy contextGuard=" + JSON.stringify(contextGuard), async () => {
+		const t = setup({
+			current: { provider: "openai-codex", id: "gpt-5.6-sol" },
+			config: contextGuard === undefined ? {} : { contextGuard },
 		});
-	}
-	const warning = t.rec.notifies.find((n: string) =>
-		n.includes("context guard is NOT running"),
-	);
-	assert.ok(
-		warning,
-		`expected a warning, got: ${JSON.stringify(t.rec.notifies)}`,
-	);
-	// Said once, not on every turn.
-	assert.equal(
-		t.rec.notifies.filter((n: string) =>
-			n.includes("context guard is NOT running"),
-		).length,
-		1,
-	);
-});
-
-test("the context guard says so when it has no window to measure against", async () => {
-	const t = setup({ current: { provider: "openai-codex", id: "gpt-5.6-sol" } });
-	// mkModel has no contextWindow — the guard stands down, and silently standing down is exactly
-	// the state a user must be told about rather than left to discover from an overflow.
-	const usage = {
-		input: 100,
-		output: 10,
-		cacheRead: 0,
-		cacheWrite: 0,
-		totalTokens: 110,
-	};
-	for (let i = 0; i < 6; i++) {
-		await t.fire("context", { messages: bigConversation(1) });
-		await t.fire("message_end", {
-			message: {
-				role: "assistant",
-				provider: "openai-codex",
-				model: "gpt-5.6-sol",
-				stopReason: "stop",
-				timestamp: 6000 + i,
-				content: [{ type: "text", text: "ok" }],
-				usage,
-			},
-		});
-	}
-	assert.ok(
-		t.rec.notifies.some((n: string) => n.includes("standing down")),
-		`expected a stand-down warning, got: ${JSON.stringify(t.rec.notifies)}`,
-	);
-	assert.equal(
-		t.rec.notifies.some((n: string) =>
-			n.includes("context guard is NOT running"),
-		),
-		false,
-		"the hook is alive here — only the window is missing",
-	);
-});
-
-test("a healthy guarded session says nothing at all", async () => {
-	const t = setup({ current: { provider: "openai-codex", id: "gpt-5.6-sol" } });
-	t.ctx.model.contextWindow = 272_000;
-	t.ctx.getSystemPrompt = () => "";
-	const usage = {
-		input: 100,
-		output: 10,
-		cacheRead: 0,
-		cacheWrite: 0,
-		totalTokens: 110,
-	};
-	for (let i = 0; i < 6; i++) {
-		await t.fire("context", { messages: bigConversation(1) });
-		await t.fire("message_end", {
-			message: {
-				role: "assistant",
-				provider: "openai-codex",
-				model: "gpt-5.6-sol",
-				stopReason: "stop",
-				timestamp: 7000 + i,
-				content: [{ type: "text", text: "ok" }],
-				usage,
-			},
-		});
-	}
-	assert.equal(
-		t.rec.notifies.some((n: string) => n.includes("context guard")),
-		false,
-		`a working guard must be silent; got: ${JSON.stringify(t.rec.notifies)}`,
-	);
-});
-
-// ---------------------------------------------------------------------------
-// Carrying the task on after an automatic compaction
-//
-// Pi ends the run whenever a threshold compaction fires. The continuation route is Pi's own:
-// `_runAutoCompaction` returns `this.agent.hasQueuedMessages()`, and `_runAgentPrompt` turns a
-// `true` there into `agent.continue()`, which drains the follow-up queue. Pi uses that for
-// overflow recovery but queues nothing on the threshold path. These lock the one queued
-// follow-up, and every case where it must stay silent.
-// ---------------------------------------------------------------------------
-
-/** Fire session_compact the way Pi does mid-run: the run loop is still live. */
-async function fireCompact(
-	t: ReturnType<typeof setup>,
-	over: Record<string, unknown> = {},
-) {
-	t.setIdle(false);
-	return t.fire("session_compact", {
-		compactionEntry: { type: "compaction", summary: "s", firstKeptEntryId: "e1" },
-		fromExtension: false,
-		reason: "threshold",
-		willRetry: false,
-		...over,
+		t.ctx.model.contextWindow = 272_000;
+		t.ctx.getSystemPrompt = () => "s".repeat(24_000);
+		const messages = bigConversation(50);
+		const before = JSON.stringify(messages);
+		assert.equal(await t.fire("context", { messages }), undefined);
+		assert.equal(JSON.stringify(messages), before, "the transcript and outgoing request remain intact");
+		for (const idle of [false, true]) {
+			t.setIdle(idle);
+			await t.fire("agent_settled");
+		}
+		await t.fire("session_compact", { reason: "threshold", fromExtension: false });
+		assert.equal(await t.fire("context", { messages }), undefined);
+		assert.deepEqual(t.rec.compacts, []);
+		assert.deepEqual(t.rec.customMessages, []);
+		assert.equal(t.rec.notifies.some((n) => /context.guard|older tool output/i.test(n)), false);
 	});
 }
 
-const continuations = (t: ReturnType<typeof setup>) =>
-	t.rec.customMessages.filter(
-		(m) => m.message?.customType === "multi-account:continue-after-compaction",
-	);
+// ---------------------------------------------------------------------------
+// Legacy compaction configuration is accepted as inert data, not a way to re-enable the feature.
+// ---------------------------------------------------------------------------
 
-test("an automatic compaction carries the task on instead of ending the run", async () => {
-	const t = setup({ current: { provider: "openai-codex", id: "gpt-5.6-sol" } });
-	await t.fire("agent_start");
-	await fireCompact(t);
-
-	const queued = continuations(t);
-	assert.equal(queued.length, 1, "exactly one follow-up may be queued");
-	// followUp is what agent.continue() drains when the last message is an assistant — which is
-	// always the case right after a compaction rebuilt the context.
-	assert.equal(queued[0].options?.deliverAs, "followUp");
-	assert.equal(
-		queued[0].message.display,
-		true,
-		"the user must be able to see why it carried on",
-	);
-	const text = String(queued[0].message.content);
-	assert.match(text, /compacted/i);
-	// The escape hatch that makes this safe: ~a third of compactions land on finished work, and
-	// no cheap signal separates them, so the model is told plainly that "done" is a valid answer.
-	assert.match(text, /really is finished/i);
-	assert.match(text, /[Dd]o not restart/);
-});
-
-test("it stays out of the way when Pi is already continuing the turn itself", async () => {
-	const t = setup({ current: { provider: "openai-codex", id: "gpt-5.6-sol" } });
-	await t.fire("agent_start");
-	// Overflow recovery: Pi returns true from _runAutoCompaction on its own and calls continue().
-	await fireCompact(t, { reason: "overflow", willRetry: true });
-	assert.equal(
-		continuations(t).length,
-		0,
-		"a second queued message would double the turn",
-	);
-});
-
-test("a manual /compact is a deliberate pause and is never resumed", async () => {
-	const t = setup({ current: { provider: "openai-codex", id: "gpt-5.6-sol" } });
-	await t.fire("agent_start");
-	await fireCompact(t, { reason: "manual" });
-	assert.equal(continuations(t).length, 0);
-});
-
-test("nothing is queued once the session is idle", async () => {
-	const t = setup({ current: { provider: "openai-codex", id: "gpt-5.6-sol" } });
-	await t.fire("agent_start");
-	t.setIdle(true);
-	// With no live run the follow-up queue is never drained; the same call would instead append a
-	// stray message that nothing delivers.
-	await t.fire("session_compact", {
-		compactionEntry: { type: "compaction", summary: "s", firstKeptEntryId: "e1" },
-		reason: "threshold",
-		willRetry: false,
+for (const legacy of [undefined, true, false]) {
+	test("legacy compact settings are ignored (" + String(legacy) + ")", async () => {
+		const t = setup({
+			current: { provider: "openai-codex", id: "gpt-5.6-sol" },
+			config: legacy === undefined ? {} : {
+				continueAfterCompaction: legacy,
+				routeCompactionToHealthyAccount: legacy,
+				compactionWatchdogMs: 1,
+				contextGuard: { compactPercent: 0.01 },
+			},
+		});
+		t.ctx.model.contextWindow = 272_000;
+		// Legacy settings cannot restore either compaction or request trimming here.
+		assert.equal(await t.fire("context", { messages: bigConversation(50) }), undefined);
+		await t.fire("agent_settled");
+		for (const reason of ["threshold", "overflow", "manual"]) {
+			t.setIdle(false);
+			await t.fire("session_compact", { reason, willRetry: false, fromExtension: false });
+		}
+		assert.deepEqual(t.rec.compacts, []);
+		assert.deepEqual(t.rec.customMessages, []);
+		assert.deepEqual(t.rec.continueCalls, []);
+		assert.deepEqual(t.rec.sent, []);
+		await t.command("status full");
+		assert.equal(t.rec.notifies.some((n) => /Compaction routing:/i.test(n)), false);
 	});
-	assert.equal(continuations(t).length, 0);
-});
-
-test("pressing Esc stops the work; a compaction must not undo that", async () => {
-	const t = setup({ current: { provider: "openai-codex", id: "gpt-5.6-sol" } });
-	await t.fire("agent_start");
-	const aborted = {
-		role: "assistant",
-		provider: "openai-codex",
-		model: "gpt-5.6-sol",
-		stopReason: "aborted",
-		timestamp: messageTimestamp++,
-		content: [{ type: "text", text: "half a thought" }],
-	};
-	t.setIdle(true);
-	await t.fire("agent_end", { messages: [aborted] });
-	await fireCompact(t);
-	assert.equal(
-		continuations(t).length,
-		0,
-		"the user cancelled — carrying on would override them",
-	);
-});
-
-test("the auto-continue budget is shared with failover, not doubled", async () => {
-	const t = setup({
-		current: { provider: "openai-codex", id: "gpt-5.6-sol" },
-		config: { maxAutoContinuesPerPrompt: 2 },
-	});
-	await t.fire("agent_start");
-	await fireCompact(t);
-	await fireCompact(t);
-	assert.equal(continuations(t).length, 2, "within budget");
-	await fireCompact(t);
-	assert.equal(
-		continuations(t).length,
-		2,
-		"a task must not be able to keep itself alive forever",
-	);
-});
-
-test("contextGuard and continueAfterCompaction can each be turned off alone", async () => {
-	const off = setup({
-		current: { provider: "openai-codex", id: "gpt-5.6-sol" },
-		config: { continueAfterCompaction: false },
-	});
-	await off.fire("agent_start");
-	await fireCompact(off);
-	assert.equal(continuations(off).length, 0);
-
-	const on = setup({ current: { provider: "openai-codex", id: "gpt-5.6-sol" } });
-	await on.fire("agent_start");
-	await fireCompact(on);
-	assert.equal(continuations(on).length, 1, "default is on");
-});
+}
 
 // ---------------------------------------------------------------------------
 // The failover ladder — where work goes once the whole provider is spent

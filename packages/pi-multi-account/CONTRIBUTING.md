@@ -14,25 +14,54 @@ requests are welcome. All PRs are reviewed by the maintainer before merge.
 ## Development setup
 
 ```bash
-git clone https://github.com/Sarrius/pi-multi-account.git
-cd pi-multi-account
-npm install
+git clone https://github.com/Eryx-Z/pi-extensions.git
+cd pi-extensions
+npm ci
 ```
 
-Requirements: Node.js >= 22.
+Requirements: Node.js >= 22.19.0. Install from the repository root; the workspaces
+share the root lockfile.
 
 ## Before you open a PR
 
 ```bash
-npm run check        # TypeScript type-check (tsc --noEmit)
-npm run pack:check   # npm pack --dry-run — verify the published file set
+npm run check                                     # All workspace type checks and tests
+npm run pack:check --workspace pi-multi-account    # Verify the published file set
 ```
 
 CI runs the same checks on every pull request; they must pass before review.
 
+## Module boundaries
+
+- `index.ts`: parent-session discovery, failover, commands and lifecycle hooks.
+- `subagent-provider.ts` → `provider-slots.ts`: provider-only Codex/Antigravity RPC startup.
+  Neither module may import the parent entry point, Grok, Cursor or command registration.
+- `pi-ai-bridge.ts`: lazy OAuth/catalog compatibility across supported pi-ai versions.
+- `auth-state.ts`: credential persistence, identity and refresh-race recovery.
+- `failover-config.ts`: configuration defaults, normalization and loading.
+  `normalizeConfig({})` is the only defaults source; old config files are not rewritten.
+- `cooldown.ts`: header/body/usage cooldown estimates; caps and session decisions stay in the parent.
+- `pi-files.ts`: published-file shape inspection, child visibility and atomic slot catalogs.
+- `failover-state.ts`: versioned state migration and best-effort atomic persistence.
+- `request-shaping.ts`: Anthropic OAuth payload shaping and Qwen role compatibility.
+- `interrupted-turns.ts`: deterministic, bounded interrupted-turn handoff records.
+- `provider-ids.ts`, `account-display.ts`, `agent-paths.ts`: shared naming, labels and paths.
+- `cursor/models.ts`: catalog normalization and model configuration; shared and
+  single-account Cursor entry points use the same implementation.
+
+Codex slot provisioning delegates to the catalog registration body after its native-base
+guard. Do not apply that guard to catalog sync: it must still enrich the native provider.
+Keep pure handoff tests in `test/interrupted-context.test.ts`, with one entry-point alias
+check and the real installed pi-ai transform integration, not a second parallel unit suite.
+
+Existing named exports from `index.ts` and `cursor/index.ts` remain compatibility
+re-exports. Boundary tests follow transitive imports, not just direct imports.
+Keep new RPC dependencies in the package's publish file list.
+
 ## Coding guidelines
 
-- The whole extension lives in `index.ts`. Match the surrounding style.
+- Match the surrounding style. Keep provider-specific code separate from unrelated
+  failover/session behavior when adding modules.
 - Prefer small, well-commented guards over clever one-liners — failover logic is
   safety-critical (a bad loop can peg a machine).
 - Update `CHANGELOG.md` under a new version / `Unreleased` heading describing the
@@ -40,20 +69,15 @@ CI runs the same checks on every pull request; they must pass before review.
 
 ## Releasing (maintainer only)
 
-Publishing runs on GitHub Actions through npm **trusted publishing** (OIDC). There is no
-npm token anywhere, and `npm publish` is never run from a laptop — the workflow refuses to
-publish unless it is checked out on the tag matching `package.json`.
+This repository has a validation workflow, not an automated publishing workflow.
+Do not use the upstream repository's `publish.yml` instructions here.
 
-1. Bump `version` in **both** `package.json` and `const VERSION` in `index.ts` — they must
-   match — and add the `CHANGELOG.md` entry.
-2. Land the change on `main` via PR (CI must be green).
-3. Tag and push the tag:
-   `git tag -a vX.Y.Z -m "vX.Y.Z" && git push origin vX.Y.Z`
-4. Dry run first — this exercises the whole pipeline without uploading:
-   `gh workflow run publish.yml --ref vX.Y.Z -f dist_tag=latest -f dry_run=true`
-5. When that is green, publish for real:
-   `gh workflow run publish.yml --ref vX.Y.Z -f dist_tag=latest -f dry_run=false`
-6. Create the GitHub release for the tag.
+Before preparing a release:
 
-`--ref` must be the **tag**, not a branch: the workflow asserts `GITHUB_REF_TYPE=tag` and
-`GITHUB_REF_NAME=v<version>`, so dispatching from `main` fails that guard by design.
+1. Finish and commit any coordinated workspace migration; do not release a dirty tree.
+2. Bump `version` in **both** this package's `package.json` and `const VERSION` in
+   `index.ts`, and add the `CHANGELOG.md` entry.
+3. From the repository root, run `npm run check` and
+   `npm run release:check --workspace pi-multi-account`.
+4. Have the maintainer confirm publishing credentials and the release procedure.
+   The checks above do not publish anything.

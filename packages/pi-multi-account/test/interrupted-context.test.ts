@@ -8,58 +8,30 @@
  * received a continuation prompt saying "do not repeat completed work" with the record of
  * that work already deleted, plus tool results left with no originating call.
  *
- * The first test proves the loss against the REAL pi-ai transform rather than a mock,
+ * The integration test proves the loss against the REAL pi-ai transform rather than a mock,
  * because an in-process mock is exactly what would not have caught this.
  */
 import assert from "node:assert/strict";
-import { existsSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
 import test from "node:test";
 
-const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
+import {
+	preserveInterruptedTurns,
+	renderHandoffRecord,
+} from "../interrupted-turns.ts";
 
-const { preserveInterruptedTurns, renderHandoffRecord } = (await import(
-	"../index.ts"
-)) as {
-	preserveInterruptedTurns: (messages: any[]) => any[];
-	renderHandoffRecord: (
-		message: any,
-		results: Map<string, any>,
-	) => string | undefined;
-};
 
-/**
- * pi-ai does not re-export `transformMessages` from its package entry, so this loads the
- * module by path. Missing or moved ⇒ the integration assertion is skipped rather than
- * failing CI on an unrelated pi-ai layout change; the unit tests below still hold.
- */
-async function loadPiAiTransform(): Promise<
-	((messages: any[], model: any, normalize?: any) => any[]) | undefined
-> {
-	for (const root of [
-		join(REPO_ROOT, "node_modules"),
-		join(REPO_ROOT, "..", "..", "..", "..", "..", "node_modules"),
-	]) {
-		const file = join(
-			root,
-			"@earendil-works",
-			"pi-ai",
-			"dist",
-			"api",
-			"transform-messages.js",
-		);
-		if (!existsSync(file)) continue;
-		try {
-			const mod = await import(`file://${file}`);
-			if (typeof mod.transformMessages === "function")
-				return mod.transformMessages;
-		} catch {
-			// fall through to the next candidate root
-		}
-	}
-	return undefined;
-}
+// Compatibility contract only: pure-function behavior is tested through its owner below.
+test("index keeps the interrupted-turn module exports as compatibility aliases", async () => {
+	const entry = await import("../index.ts");
+	assert.equal(entry.preserveInterruptedTurns, preserveInterruptedTurns);
+	assert.equal(entry.renderHandoffRecord, renderHandoffRecord);
+});
+
+// Resolve the installed core package instead of maintaining checkout/hoisting guesses.
+// pi-ai is a required dependency; a moved transform must fail this integration test, not skip it.
+const { transformMessages } = await import(
+	new URL("./api/transform-messages.js", import.meta.resolve("@earendil-works/pi-ai")).href
+);
 
 const DEAD_MODEL = {
 	provider: "openai-codex",
@@ -124,12 +96,7 @@ function interruptedTranscript() {
 	];
 }
 
-test("REAL pi-ai transform erases the interrupted turn; preservation carries it across a provider switch", async (t) => {
-	const transformMessages = await loadPiAiTransform();
-	if (!transformMessages) {
-		t.skip("pi-ai transform-messages.js not resolvable in this install layout");
-		return;
-	}
+test("REAL pi-ai transform erases the interrupted turn; preservation carries it across a provider switch", () => {
 
 	// 1. Baseline — what the next account sees today, without preservation.
 	const bare = transformMessages(interruptedTranscript(), LIVE_MODEL, undefined);
@@ -187,26 +154,61 @@ test("REAL pi-ai transform erases the interrupted turn; preservation carries it 
 });
 
 test("the handoff record marks which tool calls never returned", () => {
-	const [record] = preserveInterruptedTurns(interruptedTranscript()).filter(
-		(m: any) => m.role === "user" && String(m.content?.[0]?.text).includes("[handoff:"),
+	const messages: any[] = interruptedTranscript();
+	const cyclic: Record<string, unknown> = {};
+	cyclic.self = cyclic;
+	messages[1].content.push(
+		{ type: "toolCall", id: "cycle", name: "cycle", arguments: cyclic },
+		{ type: "toolCall", id: "empty", name: "empty" },
+		{ type: "toolCall", id: "failure", name: "bash", arguments: { command: "db:retry" } },
 	);
+	const completed = {
+		role: "assistant", stopReason: "stop", content: [{ type: "text", text: "completed work" }],
+	};
+	const unrelated = { role: "toolResult", toolCallId: "other", content: "unrelated result" };
+	// Results are looked up across the whole transcript, not just adjacent to the call.
+	messages.splice(2, 0, completed, unrelated);
+	messages.push(
+		{ role: "toolResult", toolCallId: "cycle", content: "string result" },
+		{ role: "toolResult", toolCallId: "empty", content: [{ type: "image", data: "not-readable" }] },
+		{ role: "toolResult", toolCallId: "failure", isError: true, content: [{ type: "text", text: "migration failed: already applied" }] },
+	);
+	const preserved = preserveInterruptedTurns(messages);
+	assert.equal(preserved.length, 4);
+	assert.equal(preserved[0], messages[0]);
+	assert.equal(preserved[2], completed);
+	assert.equal(preserved[3], unrelated, "unrelated results must not be consumed");
+	const record = preserved[1];
 	const text = String(record.content[0].text);
 	assert.ok(
 		/db:migrate[\s\S]*result: migration 0042 applied/.test(text),
 		"a completed call must carry its result",
 	);
-	assert.ok(
-		/db:seed[\s\S]*result: NONE/.test(text),
-		"a call that never returned must be flagged as unknown, not silently dropped",
-	);
+	assert.match(text, /db:seed[\s\S]*result: NONE[^\n]*UNKNOWN/,
+		"a call that never returned must be flagged as unknown, not silently dropped");
+	assert.match(text, /arguments: <unserializable arguments>/);
+	assert.match(text, /result: string result/);
+	assert.match(text, /arguments: \{\}/);
+	assert.match(text, /result: <empty>/);
+	assert.match(text, /db:retry[\s\S]*result \(error\): migration failed: already applied/);
+	assert.ok(text.includes(SECRET_REASONING));
+	assert.ok(text.includes(SECRET_OUTPUT));
+	assert.ok(text.includes("Codex error: The usage limit has been reached"));
+	assert.equal(text.includes("not-readable"), false);
 });
 
 test("preservation is byte-identical on replay so it never invalidates the prompt cache", () => {
 	// The hook runs before EVERY request. A record that re-renders differently each time
 	// would move the cache breakpoint and force a full re-read of the transcript.
-	const first = JSON.stringify(preserveInterruptedTurns(interruptedTranscript()));
+	const messages = interruptedTranscript();
+	const before = structuredClone(messages);
+	const preserved = preserveInterruptedTurns(messages);
+	const first = JSON.stringify(preserved);
 	const second = JSON.stringify(preserveInterruptedTurns(interruptedTranscript()));
 	assert.equal(first, second);
+	assert.deepEqual(preserveInterruptedTurns(messages), preserved, "rerendering is deterministic");
+	assert.deepEqual(messages, before, "preservation must not mutate session messages");
+	assert.equal(preserveInterruptedTurns(preserved), preserved, "records are not wrapped again");
 });
 
 test("a transcript with no interrupted turn is returned untouched", () => {
@@ -219,11 +221,19 @@ test("a transcript with no interrupted turn is returned untouched", () => {
 			timestamp: 2,
 		},
 	];
-	assert.equal(
-		preserveInterruptedTurns(clean),
+	for (const messages of [
+		[],
 		clean,
-		"identity must be preserved so the hook can skip returning a result at all",
-	);
+		[{ role: "user", content: "question" }, ...clean.slice(1), { role: "toolResult", toolCallId: "unrelated", content: "result" }],
+	]) {
+		const before = structuredClone(messages);
+		assert.equal(
+			preserveInterruptedTurns(messages),
+			messages,
+			"identity must be preserved so the hook can skip returning a result at all",
+		);
+		assert.deepEqual(messages, before);
+	}
 });
 
 test("an interrupted turn with nothing to preserve is left to pi's normal drop path", () => {
@@ -232,8 +242,16 @@ test("an interrupted turn with nothing to preserve is left to pi's normal drop p
 	const empty = [
 		{ role: "user", content: [{ type: "text", text: "go" }], timestamp: 1 },
 		{ role: "assistant", stopReason: "aborted", content: [], timestamp: 2 },
+		{ role: "assistant", stopReason: "error", errorMessage: "failure alone is not work" },
+		{
+			role: "assistant", stopReason: "error",
+			content: [{ type: "thinking", thinking: "opaque", redacted: true }],
+		},
 	];
+	const before = structuredClone(empty);
 	assert.equal(preserveInterruptedTurns(empty), empty);
+	assert.deepEqual(empty, before);
+	assert.equal(renderHandoffRecord({ content: [], errorMessage: "error only" }, new Map()), undefined);
 });
 
 test("redacted thinking is not resurrected as plain text", () => {
@@ -242,18 +260,28 @@ test("redacted thinking is not resurrected as plain text", () => {
 	const record = renderHandoffRecord(
 		{
 			role: "assistant",
-			stopReason: "error",
-			provider: "anthropic",
-			model: "claude-opus-4-8",
+			stopReason: "aborted",
 			content: [
+				{ type: "thinking", thinking: "readable reasoning", signature: "private-signature" },
 				{ type: "thinking", thinking: "encrypted-blob", redacted: true },
-				{ type: "text", text: "visible answer" },
+				{ type: "text", text: "visible answer", signature: "private-text-metadata" },
+				{ type: "image", data: "assistant-image-data" },
+				{ type: "toolCall", id: "read", name: "read", arguments: { path: "README.md" } },
 			],
 		},
-		new Map(),
+		new Map([
+			["read", { content: [
+				{ type: "text", text: "visible result" },
+				{ type: "image", data: "tool-image-data" },
+			] }],
+		]),
 	);
-	assert.ok(record && record.includes("visible answer"));
-	assert.equal(record?.includes("encrypted-blob"), false);
+	assert.ok(record);
+	assert.match(record, /the previous account.*cancelled/);
+	for (const readable of ["readable reasoning", "visible answer", "visible result", "README.md"])
+		assert.ok(record.includes(readable));
+	for (const opaque of ["private-signature", "encrypted-blob", "private-text-metadata", "assistant-image-data", "tool-image-data"])
+		assert.equal(record.includes(opaque), false);
 });
 
 test("oversized turns are clipped head+tail so failover can never blow the context window", () => {
@@ -275,6 +303,50 @@ test("oversized turns are clipped head+tail so failover can never blow the conte
 		"the tail matters most: it is where the turn actually stopped",
 	);
 	assert.ok(record.includes("characters omitted"));
+
+	const section = (label: string) => `${label}_HEAD${"x".repeat(50_000)}${label}_TAIL`;
+	const calls = Array.from({ length: 14 }, (_, index) => ({
+		type: "toolCall",
+		id: `call-${index + 1}`,
+		name: `tool-${index + 1}`,
+		arguments: { body: section("ARGS") },
+	}));
+	const message = {
+		role: "assistant", stopReason: "error", errorMessage: section("ERROR"),
+		content: [
+			{ type: "text", text: section("TEXT") },
+			{ type: "thinking", thinking: section("THINKING") },
+			...calls,
+		],
+	};
+	const results = calls.map((call) => ({
+		role: "toolResult", toolCallId: call.id, content: section("RESULT"),
+	}));
+	const bounded = renderHandoffRecord(message, new Map(results.map((result) => [result.toolCallId, result])));
+	assert.ok(bounded);
+	for (const label of ["TEXT", "THINKING", "ARGS", "RESULT", "ERROR"]) {
+		assert.ok(bounded.includes(`${label}_HEAD`));
+		assert.ok(bounded.includes(`${label}_TAIL`));
+	}
+	for (const [length, cap] of [
+		[section("TEXT").length, 4000],
+		[section("THINKING").length, 3000],
+		[JSON.stringify(calls[0].arguments).length, 800],
+		[section("RESULT").length, 1000],
+		[section("ERROR").length, 400],
+	]) {
+		assert.ok(bounded.includes(`[${length - cap} characters omitted]`));
+	}
+	assert.equal(bounded.includes("x".repeat(5_000)), false);
+	assert.match(bounded, /12\. tool-12 — arguments:/);
+	assert.equal(bounded.includes("tool-13 —"), false);
+	assert.equal(bounded.includes("tool-14 —"), false);
+	assert.match(bounded, /2 further tool call\(s\) omitted/);
+	// Existing per-section caps total 29k characters before rendering overhead.
+	assert.ok(bounded.length < 36_000, `bounded record expected, got ${bounded.length}`);
+	const preserved = preserveInterruptedTurns([message, ...results]);
+	assert.equal(preserved.length, 1, "even results of omitted calls are removed, never orphaned");
+	assert.equal(preserved[0].content[0].text, bounded);
 });
 
 test("every interrupted turn in a long session is preserved, not just the last one", () => {
@@ -296,15 +368,33 @@ test("every interrupted turn in a long session is preserved, not just the last o
 			content: [{ type: "text", text: "SECOND_ATTEMPT" }],
 			timestamp: 3,
 		},
+		{
+			role: "assistant",
+			stopReason: "aborted",
+			provider: "anthropic",
+			model: "claude-opus-4-8",
+			content: [{ type: "text", text: "Cancelled follow-up work." }],
+			timestamp: 4,
+		},
 	];
 	const records = preserveInterruptedTurns(messages).filter(
 		(m: any) =>
 			m.role === "user" &&
 			String(m.content?.[0]?.text ?? "").includes("[handoff:interrupted-turn]"),
 	);
-	assert.equal(records.length, 2, "each interrupted turn needs its own record");
+	assert.equal(records.length, 3, "each interrupted turn needs its own record");
 	const text = JSON.stringify(records);
 	assert.ok(text.includes("FIRST_ATTEMPT") && text.includes("SECOND_ATTEMPT"));
+	assert.match(records[0].content[0].text, /\[handoff:interrupted-turn\].*openai-codex\/gpt-5\.6-sol.*interrupted/);
+	assert.match(records[1].content[0].text, /anthropic\/claude-opus-4-8.*interrupted/);
+	assert.match(records[2].content[0].text, /anthropic\/claude-opus-4-8.*cancelled/);
+	assert.ok(records[2].content[0].text.includes("Cancelled follow-up work."));
+	for (const [index, record] of records.entries()) {
+		assert.equal(record.role, "user", "plain user text is portable across model vendors");
+		assert.equal(record.timestamp, messages[index + 1].timestamp);
+		assert.equal(record.content.length, 1);
+		assert.equal(record.content[0].type, "text");
+	}
 	assert.equal(
 		preserveInterruptedTurns(messages).some((m: any) => m.role === "assistant"),
 		false,

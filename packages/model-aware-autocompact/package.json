@@ -1,20 +1,29 @@
 {
-  "name": "model-aware-autocompact",
-  "version": "1.0.0",
-  "private": true,
-  "type": "module",
-  "description": "Model-aware automatic context compaction for Pi",
-  "keywords": [
-    "pi-package",
-    "pi-extension",
-    "autocompact"
-  ],
-  "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "*"
-  },
-  "pi": {
-    "extensions": [
-      "./index.ts"
-    ]
-  }
+	"name": "model-aware-autocompact",
+	"version": "1.0.0",
+	"private": true,
+	"type": "module",
+	"description": "Model-aware automatic context compaction and cached tool-output summaries for Pi",
+	"scripts": {
+		"test": "node --import tsx --test test/*.test.ts",
+		"typecheck": "tsc -p tsconfig.json"
+	},
+	"keywords": [
+		"pi-package",
+		"pi-extension",
+		"autocompact"
+	],
+	"devDependencies": {
+		"@types/node": "^22.20.1",
+		"tsx": "^4.20.0",
+		"typescript": "^6.0.3"
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": "*"
+	},
+	"pi": {
+		"extensions": [
+			"./index.ts"
+		]
+	}
 }

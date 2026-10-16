@@ -1,10 +1,47 @@
 import { chmod, readFile, realpath, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
+export type Groups = Record<string, string[]>;
+
+export interface SkillSummary {
+  name: string;
+  description?: string;
+  source?: string;
+  sources?: string[];
+  scope?: string;
+}
+
+interface Frontmatter {
+  [key: string]: unknown;
+  metadata?: Record<string, unknown>;
+}
+
+export interface SourceOptions {
+  parseSkillFrontmatter?: (content: string) => Frontmatter;
+}
+
+interface SkillCommand {
+  name: string;
+  sourceInfo?: { source: string; path?: string; baseDir?: string };
+}
+
+export interface MutationOptions {
+  replaceFile?: (path: string, content: string, mode: number) => Promise<void>;
+  readCurrent?: (path: string) => Promise<string>;
+  validateContent?: (content: string, manualOnly: boolean, path: string) => void | Promise<void>;
+}
+
+interface PreparedChange {
+  path: string;
+  original: string;
+  updated: string;
+  mode: number;
+}
+
 const FLAG = "disable-model-invocation";
 let temporaryFileCounter = 0;
 
-function frontmatterBounds(content) {
+function frontmatterBounds(content: string) {
   const opening = content.match(/^\uFEFF?---(\r?\n)/);
   if (!opening) throw new Error("Skill file has no YAML frontmatter");
 
@@ -17,7 +54,7 @@ function frontmatterBounds(content) {
   return { start, end: closing.index };
 }
 
-export function getManualOnlyFromContent(content) {
+export function getManualOnlyFromContent(content: string) {
   const { start, end } = frontmatterBounds(content);
   const frontmatter = content.slice(start, end);
   const fieldPattern = /^(?:disable-model-invocation|"disable-model-invocation"|'disable-model-invocation')[ \t]*:[ \t]*([^#\r\n]*?)(?:[ \t]*#.*)?$/gm;
@@ -26,8 +63,8 @@ export function getManualOnlyFromContent(content) {
   return values[0] === "true";
 }
 
-export function splitCommandLine(input) {
-  const words = [];
+export function splitCommandLine(input: string) {
+  const words: string[] = [];
   let current = "";
   let quote;
   let escaped = false;
@@ -69,12 +106,12 @@ export function splitCommandLine(input) {
   return words;
 }
 
-function globMatches(value, pattern) {
+function globMatches(value: string, pattern: string) {
   const escaped = pattern.replace(/[|\\{}()[\]^$+?.]/g, "\\$&").replaceAll("*", ".*");
   return new RegExp(`^${escaped}$`, "i").test(value);
 }
 
-function parseGitUrl(raw) {
+function parseGitUrl(raw: string) {
   let clean = raw.replace(/^git:/, "").trim();
   const atRefMatch = clean.match(/(?:^git@[^:]+:[^@]+|https?:\/\/[^@]+)@(.+)$/);
   if (atRefMatch) {
@@ -87,14 +124,14 @@ function parseGitUrl(raw) {
   return { repo, owner: owner && !owner.includes("@") ? owner : undefined };
 }
 
-function cleanAuthorName(author) {
+function cleanAuthorName(author: unknown) {
   if (typeof author !== "string") return "";
   let clean = author.replace(/<[^>]*>/g, "").replace(/\([^)]*\)/g, "").trim();
   clean = clean.replace(/^["']|["']$/g, "").trim();
   return clean;
 }
 
-function extractFrontmatterMetadata(content, parseSkillFrontmatter) {
+function extractFrontmatterMetadata(content: string, parseSkillFrontmatter: SourceOptions["parseSkillFrontmatter"]): Frontmatter {
   if (parseSkillFrontmatter) {
     try {
       const parsed = parseSkillFrontmatter(content);
@@ -110,7 +147,7 @@ function extractFrontmatterMetadata(content, parseSkillFrontmatter) {
     const closing = closingPattern.exec(content);
     if (!closing) return {};
     const slice = content.slice(start, closing.index);
-    const metadata = {};
+    const metadata: Frontmatter = {};
     const authorMatch = slice.match(/^(?:metadata\s*:\s*\r?\n(?:\s+[^\r\n]*\r?\n)*?\s+author\s*:\s*|author\s*:\s*)(["']?)(.*?)\1\s*$/m);
     if (authorMatch) metadata.author = authorMatch[2].trim();
     const sourceMatch = slice.match(/^(?:metadata\s*:\s*\r?\n(?:\s+[^\r\n]*\r?\n)*?\s+source\s*:\s*|source\s*:\s*)(["']?)(.*?)\1\s*$/m);
@@ -125,14 +162,14 @@ function extractFrontmatterMetadata(content, parseSkillFrontmatter) {
   }
 }
 
-export function resolveSkillSource(command, content, options = {}) {
+export function resolveSkillSource(command: SkillCommand, content: string, options: SourceOptions = {}) {
   const rawSource = command.sourceInfo?.source ?? "auto";
   const skillPath = command.sourceInfo?.path ?? "";
   const baseDir = command.sourceInfo?.baseDir ?? "";
   const name = command.name.startsWith("skill:") ? command.name.slice(6) : command.name;
   const frontmatter = extractFrontmatterMetadata(content, options.parseSkillFrontmatter);
 
-  const sources = new Set();
+  const sources = new Set<string>();
   if (rawSource && rawSource !== "auto" && rawSource !== "local") {
     sources.add(rawSource);
   }
@@ -258,10 +295,10 @@ export function resolveSkillSource(command, content, options = {}) {
   return { source: primary, sources: Array.from(sources) };
 }
 
-export function resolveSelectors(skills, selectors, groups = {}) {
-  const selectedNames = new Set();
+export function resolveSelectors<T extends SkillSummary>(skills: T[], selectors: string[], groups: Groups = {}) {
+  const selectedNames = new Set<string>();
 
-  function apply(selector, groupStack = []) {
+  function apply(selector: string, groupStack: string[] = []) {
     const value = selector.trim();
     if (!value) return;
 
@@ -290,7 +327,7 @@ export function resolveSelectors(skills, selectors, groups = {}) {
       return;
     }
 
-    let field = "name";
+    let field: "name" | "source" | "scope" = "name";
     let pattern = value;
     if (value.startsWith("source:")) {
       field = "source";
@@ -315,7 +352,7 @@ export function resolveSelectors(skills, selectors, groups = {}) {
   return skills.filter((skill) => selectedNames.has(skill.name));
 }
 
-export function searchSkills(skills, query) {
+export function searchSkills<T extends SkillSummary>(skills: T[], query: string) {
   const q = String(query ?? "").trim().toLowerCase();
   if (!q) return [...skills];
   const terms = q.split(/\s+/).filter(Boolean);
@@ -340,7 +377,7 @@ export function searchSkills(skills, query) {
   });
 }
 
-export function setManualOnlyInContent(content, manualOnly) {
+export function setManualOnlyInContent(content: string, manualOnly: boolean) {
   const { start, end } = frontmatterBounds(content);
   const frontmatter = content.slice(start, end);
   const newline = content.includes("\r\n") ? "\r\n" : "\n";
@@ -352,7 +389,7 @@ export function setManualOnlyInContent(content, manualOnly) {
   const value = manualOnly ? "true" : "false";
   let updated;
   if (matches.length === 1) {
-    updated = frontmatter.replace(fieldPattern, (_line, prefix, _oldValue, suffix) => `${prefix}${value}${suffix}`);
+    updated = frontmatter.replace(fieldPattern, (_line: string, prefix: string, _oldValue: string, suffix: string) => `${prefix}${value}${suffix}`);
   } else {
     const separator = frontmatter.length === 0 || frontmatter.endsWith("\n") ? "" : newline;
     updated = `${frontmatter}${separator}${FLAG}: ${value}${newline}`;
@@ -361,7 +398,7 @@ export function setManualOnlyInContent(content, manualOnly) {
   return content.slice(0, start) + updated + content.slice(end);
 }
 
-async function replaceFileAtomically(path, content, mode) {
+async function replaceFileAtomically(path: string, content: string, mode: number) {
   const temporaryPath = join(
     dirname(path),
     `.skill-manager-${process.pid}-${temporaryFileCounter++}.tmp`,
@@ -376,11 +413,11 @@ async function replaceFileAtomically(path, content, mode) {
   }
 }
 
-export async function applyManualOnlyChanges(changes, options = {}) {
+export async function applyManualOnlyChanges(changes: { path: string; manualOnly: boolean }[], options: MutationOptions = {}) {
   const replaceFile = options.replaceFile ?? replaceFileAtomically;
   const readCurrent = options.readCurrent ?? ((path) => readFile(path, "utf8"));
-  const prepared = [];
-  const requestedModes = new Map();
+  const prepared: PreparedChange[] = [];
+  const requestedModes = new Map<string, boolean>();
 
   for (const change of changes) {
     const path = await realpath(change.path);
@@ -401,7 +438,7 @@ export async function applyManualOnlyChanges(changes, options = {}) {
     if (updated !== original) prepared.push({ path, original, updated, mode: fileStat.mode });
   }
 
-  const completed = [];
+  const completed: PreparedChange[] = [];
   try {
     for (const item of prepared) {
       if ((await readCurrent(item.path)) !== item.original) {
@@ -431,7 +468,7 @@ export async function applyManualOnlyChanges(changes, options = {}) {
   return prepared.map((item) => item.path);
 }
 
-export async function applyManualOnlyToFiles(paths, manualOnly, options = {}) {
+export async function applyManualOnlyToFiles(paths: string[], manualOnly: boolean, options: MutationOptions = {}) {
   return applyManualOnlyChanges(
     paths.map((path) => ({ path, manualOnly })),
     options,

@@ -14,20 +14,24 @@
       "./packages/pi-open-terminal/index.ts",
       "./packages/pi-skill-manager/index.ts",
       "./packages/pi-status-hub/src/index.ts",
-      "./packages/pi-sync/dist/index.ts",
       "./packages/pi-token-usage/src/index.ts"
     ]
   },
   "scripts": {
     "build": "npm --workspaces --if-present run build",
-    "test": "npm --workspaces --if-present run test",
-    "typecheck": "npm --workspaces --if-present run typecheck"
+    "test": "npm --workspaces run test",
+    "typecheck": "npm --workspaces run typecheck",
+    "check": "npm run typecheck && npm test"
+  },
+  "engines": {
+    "node": ">=22.19.0"
   },
   "devDependencies": {
     "@earendil-works/pi-ai": "^0.85.1",
     "@earendil-works/pi-coding-agent": "^0.85.1",
     "@earendil-works/pi-tui": "^0.85.1",
     "@types/node": "^22.13.0",
-    "typescript": "^5.7.0"
+    "tsx": "^4.20.0",
+    "typescript": "^6.0.3"
   }
 }

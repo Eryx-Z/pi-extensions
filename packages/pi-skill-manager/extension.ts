@@ -1,3 +1,6 @@
+import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { FileHandle } from "node:fs/promises";
+import type { Groups, MutationOptions, SourceOptions, SkillSummary } from "./manager.ts";
 import { chmod, mkdir, open, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -11,14 +14,44 @@ import {
   splitCommandLine,
 } from "./manager.ts";
 
-async function readGroupsDocument(path) {
-  let content;
-  let parsed;
+interface ManagerOptions extends SourceOptions {
+  agentDir: string;
+  configDirName: string;
+}
+
+interface Skill extends SkillSummary {
+  description: string;
+  path: string;
+  source: string;
+  sources: string[];
+  manualOnly: boolean;
+  origin?: string;
+  baseDir?: string;
+}
+
+interface ExpectedDocument {
+  path: string;
+  content: string | undefined;
+}
+
+interface GroupScope {
+  label: string;
+  name: string;
+  path: string;
+  groups: Groups;
+  guardDocuments: ExpectedDocument[];
+  validationGroupSets: (candidate: Groups) => Groups[];
+  visibleGroupSets?: Groups[];
+}
+
+async function readGroupsDocument(path: string) {
+  let content: string | undefined;
+  let parsed: unknown;
   try {
     content = await readFile(path, "utf8");
     parsed = JSON.parse(content);
   } catch (error) {
-    if (error && typeof error === "object" && error.code === "ENOENT") {
+    if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
       content = undefined;
       parsed = {};
     } else {
@@ -29,7 +62,8 @@ async function readGroupsDocument(path) {
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
     throw new Error(`${path}: expected a JSON object`);
   }
-  const groups = parsed.groups ?? {};
+  const document = parsed as Record<string, unknown>;
+  const groups = document.groups ?? {};
   if (!groups || typeof groups !== "object" || Array.isArray(groups)) {
     throw new Error(`${path}: groups must be an object`);
   }
@@ -38,25 +72,25 @@ async function readGroupsDocument(path) {
       throw new Error(`${path}: group ${name} must be an array of selectors`);
     }
   }
-  return { content, document: parsed, groups };
+  return { content, document, groups: groups as Groups };
 }
 
-async function readGroupsFile(path) {
+async function readGroupsFile(path: string) {
   return (await readGroupsDocument(path)).groups;
 }
 
 let groupsTemporaryFileCounter = 0;
 
-async function readOptionalText(path) {
+async function readOptionalText(path: string) {
   try {
     return await readFile(path, "utf8");
   } catch (error) {
-    if (error && typeof error === "object" && error.code === "ENOENT") return undefined;
+    if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") return undefined;
     throw error;
   }
 }
 
-async function assertGroupDocumentsUnchanged(expectedDocuments) {
+async function assertGroupDocumentsUnchanged(expectedDocuments: ExpectedDocument[]) {
   for (const expected of expectedDocuments) {
     if ((await readOptionalText(expected.path)) !== expected.content) {
       throw new Error(`${expected.path}: changed while the group editor was open`);
@@ -64,10 +98,10 @@ async function assertGroupDocumentsUnchanged(expectedDocuments) {
   }
 }
 
-async function writeGroupsFile(path, groups, expectedDocuments) {
+async function writeGroupsFile(path: string, groups: Groups, expectedDocuments: ExpectedDocument[]) {
   const documents = [...new Map(expectedDocuments.map((item) => [item.path, item])).values()]
     .sort((left, right) => left.path.localeCompare(right.path));
-  const locks = [];
+  const locks: { handle: FileHandle; lockPath: string }[] = [];
   const temporaryPath = join(
     dirname(path),
     `.skill-manager-groups-${process.pid}-${groupsTemporaryFileCounter++}.tmp`,
@@ -81,7 +115,7 @@ async function writeGroupsFile(path, groups, expectedDocuments) {
         const handle = await open(lockPath, "wx", 0o600);
         locks.push({ handle, lockPath });
       } catch (error) {
-        if (error && typeof error === "object" && error.code === "EEXIST") {
+        if (error && typeof error === "object" && "code" in error && error.code === "EEXIST") {
           throw new Error(`${document.path}: another group editor is writing this config`);
         }
         throw error;
@@ -94,7 +128,7 @@ async function writeGroupsFile(path, groups, expectedDocuments) {
     try {
       mode = (await stat(path)).mode;
     } catch (error) {
-      if (!error || typeof error !== "object" || error.code !== "ENOENT") throw error;
+      if (!error || typeof error !== "object" || !("code" in error) || error.code !== "ENOENT") throw error;
     }
     await writeFile(temporaryPath, `${JSON.stringify({ ...document, groups }, null, 2)}\n`, {
       encoding: "utf8",
@@ -116,7 +150,7 @@ async function writeGroupsFile(path, groups, expectedDocuments) {
   }
 }
 
-async function resolveProjectGroupsPath(cwd, configDirName) {
+async function resolveProjectGroupsPath(cwd: string, configDirName: string) {
   const start = resolve(cwd);
   let directory = start;
   const home = resolve(homedir());
@@ -127,14 +161,14 @@ async function resolveProjectGroupsPath(cwd, configDirName) {
         return join(configDirectory, "skill-manager.json");
       }
     } catch (error) {
-      if (!error || typeof error !== "object" || error.code !== "ENOENT") throw error;
+      if (!error || typeof error !== "object" || !("code" in error) || error.code !== "ENOENT") throw error;
     }
 
     try {
       await stat(join(directory, ".git"));
       return join(configDirectory, "skill-manager.json");
     } catch (error) {
-      if (!error || typeof error !== "object" || error.code !== "ENOENT") throw error;
+      if (!error || typeof error !== "object" || !("code" in error) || error.code !== "ENOENT") throw error;
     }
 
     const parent = dirname(directory);
@@ -145,7 +179,7 @@ async function resolveProjectGroupsPath(cwd, configDirName) {
   }
 }
 
-async function loadGroups(ctx, options) {
+async function loadGroups(ctx: ExtensionContext, options: ManagerOptions) {
   const globalGroups = await readGroupsFile(join(options.agentDir, "skill-manager.json"));
   if (!ctx.isProjectTrusted()) return globalGroups;
   const projectPath = await resolveProjectGroupsPath(ctx.cwd, options.configDirName);
@@ -153,7 +187,7 @@ async function loadGroups(ctx, options) {
   return { ...globalGroups, ...projectGroups };
 }
 
-function buildAutomaticGroups(skills, customGroups) {
+function buildAutomaticGroups(skills: Skill[], customGroups: Groups) {
   const groups = new Map([[`All skills (${skills.length})`, skills]]);
   for (const scope of [...new Set(skills.map((skill) => skill.scope))].sort()) {
     const members = skills.filter((skill) => skill.scope === scope);
@@ -170,11 +204,11 @@ function buildAutomaticGroups(skills, customGroups) {
   return groups;
 }
 
-function mutationOptions(options) {
+function mutationOptions(options: ManagerOptions): MutationOptions {
   if (!options.parseSkillFrontmatter) return {};
   return {
     validateContent(content, expectedManualOnly, path) {
-      const frontmatter = options.parseSkillFrontmatter(content);
+      const frontmatter = options.parseSkillFrontmatter!(content);
       if (frontmatter["disable-model-invocation"] !== expectedManualOnly) {
         throw new Error(`${path}: semantic validation failed for disable-model-invocation`);
       }
@@ -182,8 +216,8 @@ function mutationOptions(options) {
   };
 }
 
-async function discoverSkills(pi, options, ctx) {
-  const skills = [];
+async function discoverSkills(pi: ExtensionAPI, options: ManagerOptions, ctx: ExtensionContext) {
+  const skills: Skill[] = [];
   for (const command of pi.getCommands()) {
     if (command.source !== "skill") continue;
     const name = command.name.startsWith("skill:") ? command.name.slice(6) : command.name;
@@ -216,7 +250,7 @@ async function discoverSkills(pi, options, ctx) {
   return skills.sort((left, right) => left.name.localeCompare(right.name));
 }
 
-async function updateAndReload(skills, manualOnly, ctx, options) {
+async function updateAndReload(skills: Skill[], manualOnly: boolean, ctx: ExtensionCommandContext, options: ManagerOptions) {
   const changedPaths = await applyManualOnlyToFiles(
     skills.map((skill) => skill.path),
     manualOnly,
@@ -233,7 +267,7 @@ async function updateAndReload(skills, manualOnly, ctx, options) {
   await ctx.reload();
 }
 
-async function editIndividually(skills, ctx, options) {
+async function editIndividually(skills: Skill[], ctx: ExtensionCommandContext, options: ManagerOptions) {
   const staged = new Map(skills.map((skill) => [skill.path, skill.manualOnly]));
 
   while (true) {
@@ -258,7 +292,7 @@ async function editIndividually(skills, ctx, options) {
         return;
       }
       await applyManualOnlyChanges(
-        changed.map((skill) => ({ path: skill.path, manualOnly: staged.get(skill.path) })),
+        changed.map((skill) => ({ path: skill.path, manualOnly: staged.get(skill.path)! })),
         mutationOptions(options),
       );
       ctx.ui.notify(`${changed.length} skill(s) updated; reloading`, "info");
@@ -271,8 +305,8 @@ async function editIndividually(skills, ctx, options) {
   }
 }
 
-function findGroupReferences(groupSets, targetName) {
-  const references = new Set();
+function findGroupReferences(groupSets: Groups[], targetName: string) {
+  const references = new Set<string>();
   for (const groups of groupSets) {
     for (const [name, selectors] of Object.entries(groups)) {
       if (
@@ -286,8 +320,8 @@ function findGroupReferences(groupSets, targetName) {
   return [...references].sort();
 }
 
-function renameGroup(groups, oldName, newName) {
-  const renamed = Object.create(null);
+function renameGroup(groups: Groups, oldName: string, newName: string) {
+  const renamed: Groups = Object.create(null);
   for (const [name, selectors] of Object.entries(groups)) {
     renamed[name === oldName ? newName : name] = selectors.map((selector) => {
       if (selector.trim() !== `group:${oldName}`) return selector;
@@ -299,27 +333,27 @@ function renameGroup(groups, oldName, newName) {
   return renamed;
 }
 
-function selectorsFromEditor(content) {
+function selectorsFromEditor(content: string) {
   return content
     .split(/\r?\n/)
     .map((selector) => selector.trim())
     .filter(Boolean);
 }
 
-function validateGroupGraph(groups) {
+function validateGroupGraph(groups: Groups) {
   for (const name of Object.keys(groups)) {
     resolveSelectors([], [`group:${name}`], groups);
   }
 }
 
-async function writeScopedGroups(scope, groups) {
+async function writeScopedGroups(scope: GroupScope, groups: Groups) {
   for (const resolutionGroups of scope.validationGroupSets(groups)) {
     validateGroupGraph(resolutionGroups);
   }
   await writeGroupsFile(scope.path, groups, scope.guardDocuments);
 }
 
-async function manageGroupScope(ctx, scope) {
+async function manageGroupScope(ctx: ExtensionContext, scope: GroupScope) {
   const groupNames = Object.keys(scope.groups).sort();
   const actions = ["Create group"];
   if (groupNames.length > 0) actions.push("Edit group", "Rename group", "Delete group");
@@ -391,7 +425,7 @@ async function manageGroupScope(ctx, scope) {
   if (action === "Delete group") {
     const name = await ctx.ui.select("Choose a group to delete", groupNames);
     if (!name) return;
-    const references = findGroupReferences(scope.visibleGroupSets, name);
+    const references = findGroupReferences(scope.visibleGroupSets!, name);
     if (references.length > 0) {
       ctx.ui.notify(
         `Group ${references.join(", ")} references ${name}; delete is blocked`,
@@ -411,13 +445,13 @@ async function manageGroupScope(ctx, scope) {
   }
 }
 
-async function manageCustomGroups(ctx, options) {
+async function manageCustomGroups(ctx: ExtensionContext, options: ManagerOptions) {
   const globalPath = join(options.agentDir, "skill-manager.json");
 
   while (true) {
     const globalDocument = await readGroupsDocument(globalPath);
     const globalGroups = globalDocument.groups;
-    const scopes = [
+    const scopes: GroupScope[] = [
       {
         label: `Global groups (${Object.keys(globalGroups).length})`,
         name: "global",
@@ -428,7 +462,7 @@ async function manageCustomGroups(ctx, options) {
       },
     ];
 
-    let projectGroups;
+    let projectGroups: Groups | undefined;
     if (ctx.isProjectTrusted()) {
       const projectPath = await resolveProjectGroupsPath(ctx.cwd, options.configDirName);
       const projectDocument = await readGroupsDocument(projectPath);
@@ -465,7 +499,7 @@ async function manageCustomGroups(ctx, options) {
   }
 }
 
-function formatSearchResultLabel(skill) {
+function formatSearchResultLabel(skill: Skill) {
   const icon = skill.manualOnly ? "🔴 OFF" : "🟢 ON ";
   const src = skill.source ? ` [${skill.source}]` : "";
   const desc = skill.description
@@ -474,7 +508,7 @@ function formatSearchResultLabel(skill) {
   return `${icon}  ${skill.name}${src}${desc}`;
 }
 
-async function handleSearchResults(results, query, ctx, options) {
+async function handleSearchResults(results: Skill[], query: string, ctx: ExtensionCommandContext, options: ManagerOptions) {
   const activeCount = results.filter((s) => !s.manualOnly).length;
   const disabledCount = results.length - activeCount;
 
@@ -513,7 +547,7 @@ async function handleSearchResults(results, query, ctx, options) {
   }
 }
 
-async function executeSearch(query, skills, ctx, options) {
+async function executeSearch(query: string, skills: Skill[], ctx: ExtensionCommandContext, options: ManagerOptions) {
   const matches = searchSkills(skills, query);
   if (matches.length === 0) {
     ctx.ui.notify(`No skills found matching "${query}"`, "info");
@@ -535,7 +569,7 @@ async function executeSearch(query, skills, ctx, options) {
   }
 }
 
-async function quickToggleSkills(skills, ctx, options) {
+async function quickToggleSkills(skills: Skill[], ctx: ExtensionCommandContext, options: ManagerOptions) {
   const activeCount = skills.filter((s) => !s.manualOnly).length;
   const maxNameLen = Math.max(...skills.map((s) => s.name.length), 10);
   const items = skills.map((skill) => {
@@ -559,7 +593,7 @@ async function quickToggleSkills(skills, ctx, options) {
   await updateAndReload([skill], targetManualOnly, ctx, options);
 }
 
-async function showManager(pi, ctx, options) {
+async function showManager(pi: ExtensionAPI, ctx: ExtensionCommandContext, options: ManagerOptions) {
   if (ctx.mode !== "tui") {
     ctx.ui.notify("/skills-manager without arguments requires TUI mode", "error");
     return;
@@ -657,7 +691,7 @@ async function showManager(pi, ctx, options) {
   }
 }
 
-export default function skillManagerExtension(pi, options) {
+export default function skillManagerExtension(pi: ExtensionAPI, options: ManagerOptions) {
   if (typeof pi?.on === "function") {
     pi.on("session_start", (_event, ctx) => {
       if (!ctx?.hasUI || typeof ctx.ui?.addAutocompleteProvider !== "function") return;
@@ -695,7 +729,7 @@ export default function skillManagerExtension(pi, options) {
     });
   }
 
-  const handler = async (args, ctx) => {
+  const handler = async (args: string, ctx: ExtensionCommandContext) => {
     const trimmed = String(args ?? "").trim();
     if (!trimmed) {
       try {
@@ -730,7 +764,7 @@ export default function skillManagerExtension(pi, options) {
       }
       if (words.length === 0) return;
 
-      const rawAction = words.shift();
+      const rawAction = words.shift()!;
       const action = rawAction.toLowerCase();
 
       if ((action === "list" || action === "ls" || action === "groups") && !ctx.hasUI) {
@@ -869,7 +903,7 @@ export default function skillManagerExtension(pi, options) {
 
       // Direct toggle fallback: user typed `/skills <selector>` without an explicit subcommand
       const candidateSelectors = [rawAction, ...words];
-      let selected = [];
+      let selected: Skill[] = [];
       try {
         selected = resolveSelectors(skills, candidateSelectors, groups);
       } catch {

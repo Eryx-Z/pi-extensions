@@ -6,7 +6,7 @@
  *   16:18:32  auto-compaction fires again; nothing left to summarize, so Pi drops the
  *             accumulated summary and writes a 2 032-char one starting "No prior history."
  *
- * Three independent defects stack up there:
+ * These tests retain passive handling of external compaction and checkpoint invalidation:
  *
  * 1. The bridge keeps Cursor's own server-side conversation behind a checkpoint and replays
  *    it on every request — Pi's (now compacted) message list is ignored while that checkpoint
@@ -14,8 +14,6 @@
  *    never falls back down.
  * 2. That usedTokens number was handed to Pi as prompt_tokens, so Pi kept seeing 200k+ over
  *    its 200k window and re-compacted on every single turn.
- * 3. Pi's own compact() forgets `previousSummary` when the history range is empty and only a
- *    split-turn prefix is left, silently destroying the accumulated summary.
  */
 import assert from "node:assert/strict";
 import test from "node:test";
@@ -28,7 +26,6 @@ import {
 	type StoredConversation,
 } from "../cursor/conversation-registry.ts";
 import { registerSessionLifecycleHooks } from "../cursor/session-lifecycle.ts";
-import { restorePreviousSummary } from "../compaction-summary.ts";
 
 function seedConversation(sessionId: string): StoredConversation {
 	const convKey = deriveConversationKeyFromSessionId(sessionId);
@@ -133,32 +130,6 @@ test("session cleanup still tears the session down and never resets it as a comp
 
 	assert.deepEqual(cleaned, ["gone"]);
 	assert.deepEqual(reset, [], "a switched-away session is cleaned, not recycled");
-});
-
-test("a compaction that lost its history keeps the previous summary instead of 'No prior history.'", () => {
-	// Verbatim shape of the 2 032-char summary Pi wrote at 16:18:32.
-	const damaged =
-		"No prior history.\n\n---\n\n**Turn Context (split turn):**\n\n## Original Request\nПродовжити імпорт.";
-	const previous = "## Goal\n- Поставити на карту 5 530 проспектів\n\n## Next Steps\n1. Залити піни у хмару";
-
-	const repaired = restorePreviousSummary(damaged, previous);
-
-	assert.ok(
-		repaired.startsWith(previous),
-		"the accumulated summary must survive a compaction that had nothing new to summarize",
-	);
-	assert.ok(
-		repaired.includes("**Turn Context (split turn):**"),
-		"the turn-prefix context Pi did produce must be kept",
-	);
-	assert.ok(!repaired.includes("No prior history."), "the placeholder must be gone");
-});
-
-test("restorePreviousSummary leaves healthy summaries and empty inputs alone", () => {
-	const healthy = "## Goal\n- ship it";
-	assert.equal(restorePreviousSummary(healthy, "previous"), healthy);
-	assert.equal(restorePreviousSummary("No prior history.\n\n---\n\nx", undefined), "No prior history.\n\n---\n\nx");
-	assert.equal(restorePreviousSummary("No prior history.\n\n---\n\nx", "   "), "No prior history.\n\n---\n\nx");
 });
 
 test("a checkpoint that missed turns taken on another provider is not resumed", () => {

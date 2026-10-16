@@ -22,7 +22,7 @@ import {
   pollCursorAuth,
   refreshCursorToken,
 } from "./auth.ts";
-import { FALLBACK_MODELS, modelConfig, processModels } from "./index.ts";
+import { FALLBACK_MODELS, modelConfig, processModels } from "./models.ts";
 import { getCursorModels, startProxy, type CursorModel } from "./proxy.ts";
 
 export const CURSOR_BASE = "cursor";

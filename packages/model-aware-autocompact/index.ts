@@ -3,143 +3,348 @@ import type {
 	ExtensionAPI,
 	ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
-import { readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import {
+	adoptLegacyContextGuard,
+	isValidPercent,
+	loadConfig,
+	saveConfig as persistConfig,
+	shouldAdoptLegacyGuard,
+} from "./config.ts";
+import {
+	createOverheadTracker,
+	decideGuard,
+	estimateRawTokens,
+	estimateMessageTokens,
+	type GuardMessage,
+	type OverheadTracker,
+} from "./context-guard.ts";
+import { createSummaryGuard } from "./output-summaries.ts";
 
-interface Config {
-	percent: number;
-	models: Record<string, number>;
-}
-
-const DEFAULT_PERCENT = 80;
-const CONFIG_PATH = join(getAgentDir(), "model-aware-autocompact.json");
 const STATUS_KEY = "model-aware-autocompact";
-
-function isValidPercent(value: unknown): value is number {
-	return (
-		typeof value === "number" &&
-		Number.isFinite(value) &&
-		value > 0 &&
-		value < 100
-	);
-}
-
-function loadConfig(): Config {
-	const fallback: Config = { percent: DEFAULT_PERCENT, models: {} };
-	try {
-		const value = JSON.parse(readFileSync(CONFIG_PATH, "utf8")) as {
-			percent?: unknown;
-			models?: unknown;
-		};
-		const models: Record<string, number> = {};
-		if (
-			value.models &&
-			typeof value.models === "object" &&
-			!Array.isArray(value.models)
-		) {
-			for (const [key, percent] of Object.entries(value.models)) {
-				if (isValidPercent(percent)) models[key] = percent;
-			}
-		}
-		return {
-			percent: isValidPercent(value.percent) ? value.percent : DEFAULT_PERCENT,
-			models,
-		};
-	} catch {
-		return fallback;
-	}
-}
-
-function saveConfig(): void {
-	writeFileSync(CONFIG_PATH, `${JSON.stringify(config, null, 2)}\n`, "utf8");
-}
 
 function modelKey(model: { provider: string; id: string }): string {
 	return `${model.provider}/${model.id}`;
 }
 
-function percentFor(
-	model: { provider: string; id: string } | undefined,
-): number {
-	if (!model) return config.percent;
-	return config.models[modelKey(model)] ?? config.percent;
-}
+export default function (pi: ExtensionAPI) {
+	const agentDir = getAgentDir();
+	let config = loadConfig(agentDir);
+	let pendingLegacyAdoption = shouldAdoptLegacyGuard(agentDir);
+	const saveConfig = () => persistConfig(agentDir, config);
 
-function thresholdFor(contextWindow: number, percent: number): number {
-	return Math.floor(contextWindow * (percent / 100));
-}
-
-const config = loadConfig();
-let compacting = false;
-
-function updateStatus(ctx: ExtensionContext): void {
-	if (!ctx.model?.contextWindow) {
-		ctx.ui.setStatus(STATUS_KEY, undefined);
-		return;
+	function percentFor(
+		model: { provider: string; id: string } | undefined,
+	): number {
+		if (!model) return config.percent;
+		return config.models[modelKey(model)] ?? config.percent;
 	}
 
-	const percent = percentFor(ctx.model);
-	const threshold = thresholdFor(ctx.model.contextWindow, percent);
-	const overridden = config.models[modelKey(ctx.model)] === undefined ? "" : "*";
-	const compactThreshold =
-		threshold >= 1_000_000
-			? `${Number((threshold / 1_000_000).toFixed(1))}m`
-			: `${Math.round(threshold / 1_000)}k`;
-	ctx.ui.setStatus(
-		STATUS_KEY,
-		`compact ${percent}%${overridden}/${compactThreshold}`,
-	);
-}
+	function thresholdFor(contextWindow: number, percent: number): number {
+		return Math.floor(contextWindow * (percent / 100));
+	}
 
-function compactIfNeeded(ctx: ExtensionContext): void {
-	if (compacting) return;
+	// Keep our own lock through the callback, not just session_compact (which fires
+	// before Pi clears its controller). External compactions have their own lock.
+	let compacting: object | undefined;
+	let externalCompacting = false;
+	let agentRunning = false;
+	const trackers = new Map<string, OverheadTracker>();
+	const summaryGuard = createSummaryGuard();
+	let projectionEpoch = 0;
+	let lastRequest: {
+		model: string;
+		raw: number;
+		appendedTokens: number;
+		trimmed: boolean;
+	} | undefined;
+	let summaryWarnedThisRun = false;
+	let notifiedThisRun = false;
+	let hookSeen = false;
+	let windowSeen = false;
+	let llmCalls = 0;
+	const warned = new Set<string>();
 
-	const usage = ctx.getContextUsage();
-	if (!usage || usage.tokens === null) return;
+	function trackerFor(ctx: ExtensionContext): OverheadTracker {
+		const key = ctx.model ? modelKey(ctx.model) : "?/?";
+		let tracker = trackers.get(key);
+		if (!tracker) {
+			tracker = createOverheadTracker();
+			trackers.set(key, tracker);
+		}
+		return tracker;
+	}
 
-	const percent = percentFor(ctx.model);
-	const threshold = thresholdFor(usage.contextWindow, percent);
-	if (usage.tokens < threshold) return;
+	function resetProjection(): void {
+		projectionEpoch++;
+		summaryGuard.reset();
+		lastRequest = undefined;
+	}
 
-	compacting = true;
-	if (ctx.hasUI) {
-		ctx.ui.notify(
-			`上下文已达 ${((usage.tokens / usage.contextWindow) * 100).toFixed(1)}%，开始自动 compact（阈值 ${percent}% / ${threshold.toLocaleString()} tokens）`,
-			"info",
+	function notify(
+		ctx: ExtensionContext,
+		message: string,
+		type: "info" | "warning",
+	): void {
+		try {
+			if (ctx.hasUI) ctx.ui.notify(`model-aware-autocompact: ${message}`, type);
+		} catch {
+			// A guard diagnostic must never break a request.
+		}
+	}
+
+	function warn(ctx: ExtensionContext, kind: string, message: string): void {
+		if (warned.has(kind)) return;
+		warned.add(kind);
+		notify(ctx, message, "warning");
+	}
+
+	function updateStatus(ctx: ExtensionContext): void {
+		if (!ctx.model?.contextWindow) {
+			ctx.ui.setStatus(STATUS_KEY, undefined);
+			return;
+		}
+
+		const percent = percentFor(ctx.model);
+		const threshold = thresholdFor(ctx.model.contextWindow, percent);
+		const overridden =
+			config.models[modelKey(ctx.model)] === undefined ? "" : "*";
+		const compactThreshold =
+			threshold >= 1_000_000
+				? `${Number((threshold / 1_000_000).toFixed(1))}m`
+				: `${Math.round(threshold / 1_000)}k`;
+		ctx.ui.setStatus(
+			STATUS_KEY,
+			`compact ${percent}%${overridden}/${compactThreshold}`,
 		);
 	}
 
-	ctx.compact({
-		customInstructions: `Triggered automatically at ${percent}% context usage.`,
-		onComplete: () => {
-			compacting = false;
-			if (ctx.hasUI) ctx.ui.notify("自动 compact 完成", "info");
-		},
-		onError: (error) => {
-			compacting = false;
-			if (ctx.hasUI) ctx.ui.notify(`自动 compact 失败：${error.message}`, "error");
-		},
-	});
-}
+	function compactIfNeeded(ctx: ExtensionContext): void {
+		if (
+			compacting ||
+			externalCompacting ||
+			agentRunning ||
+			!ctx.isIdle() ||
+			ctx.hasPendingMessages()
+		)
+			return;
 
-function parsePercent(value: string): number | undefined {
-	const percent = Number(value.replace(/%$/, ""));
-	return isValidPercent(percent) ? percent : undefined;
-}
+		const usage = ctx.getContextUsage();
+		// Unknown usage immediately after compaction must not reuse an old estimate.
+		if (!usage || usage.tokens === null || !(usage.contextWindow > 0)) return;
 
-export default function (pi: ExtensionAPI) {
+		let tokens = usage.tokens;
+		if (
+			ctx.model &&
+			lastRequest?.model === modelKey(ctx.model) &&
+			lastRequest.trimmed
+		) {
+			// A trimmed provider report must not hide untrimmed transcript growth from
+			// the configured percentage policy. Never reuse a different model/projection.
+			tokens = Math.max(
+				tokens,
+				trackerFor(ctx).adjust(lastRequest.raw + lastRequest.appendedTokens),
+			);
+		}
+		const percent = percentFor(ctx.model);
+		const threshold = thresholdFor(usage.contextWindow, percent);
+		if (tokens < threshold) return;
+
+		const owner = {};
+		compacting = owner;
+		if (ctx.hasUI) {
+			ctx.ui.notify(
+				`上下文已达 ${((tokens / usage.contextWindow) * 100).toFixed(1)}%，开始自动 compact（阈值 ${percent}% / ${threshold.toLocaleString()} tokens）`,
+				"info",
+			);
+		}
+
+		try {
+			ctx.compact({
+				customInstructions: `Triggered automatically at ${percent}% context usage.`,
+				onComplete: () => {
+					if (compacting !== owner) return;
+					compacting = undefined;
+					resetProjection();
+					if (ctx.hasUI) ctx.ui.notify("自动 compact 完成", "info");
+				},
+				onError: (error) => {
+					if (compacting !== owner) return;
+					compacting = undefined;
+					if (ctx.hasUI)
+						ctx.ui.notify(`自动 compact 失败：${error.message}`, "error");
+				},
+			});
+		} catch (error) {
+			if (compacting === owner) compacting = undefined;
+			throw error;
+		}
+	}
+
+	function parsePercent(value: string): number | undefined {
+		const percent = Number(value.replace(/%$/, ""));
+		return isValidPercent(percent) ? percent : undefined;
+	}
+
 	pi.on("session_start", (_event, ctx) => {
-		compacting = false;
+		compacting = undefined;
+		externalCompacting = false;
+		agentRunning = false;
+		resetProjection();
+		trackers.clear();
+		hookSeen = false;
+		windowSeen = false;
+		llmCalls = 0;
+		warned.clear();
+		notifiedThisRun = false;
+		summaryWarnedThisRun = false;
 		updateStatus(ctx);
+		if (pendingLegacyAdoption) {
+			pendingLegacyAdoption = false;
+			try {
+				config = adoptLegacyContextGuard(agentDir, config.contextGuard);
+				updateStatus(ctx);
+			} catch (error) {
+				notify(
+					ctx,
+					`could not save the inherited contextGuard setting: ${error instanceof Error ? error.message : String(error)}`,
+					"warning",
+				);
+			}
+		}
+	});
+	pi.on("session_tree", () => resetProjection());
+	pi.on("session_shutdown", () => resetProjection());
+
+	pi.on("context", async (event, ctx) => {
+		if (!config.contextGuard.enabled || compacting || externalCompacting) return;
+		hookSeen = true;
+		lastRequest = undefined;
+		if (event.messages.length === 0) return;
+		let systemPrompt = "";
+		try {
+			systemPrompt = ctx.getSystemPrompt() ?? "";
+		} catch {
+			/* still measure messages */
+		}
+		const messages = event.messages as unknown as GuardMessage[];
+		const raw = estimateRawTokens(messages, systemPrompt);
+		const tracker = trackerFor(ctx);
+		const settings = config.contextGuard;
+		const decision = decideGuard(
+			tracker.adjust(raw),
+			ctx.model?.contextWindow ?? 0,
+			settings,
+		);
+		const request = {
+			model: ctx.model ? modelKey(ctx.model) : "?/?",
+			raw,
+			appendedTokens: 0,
+			trimmed: false,
+		};
+		lastRequest = request;
+		if (decision.window <= 0) return;
+		windowSeen = true;
+		const epoch = projectionEpoch;
+		const plan = await summaryGuard.apply(
+			messages,
+			{
+				targetTokens: decision.trim
+					? decision.targetTokens
+					: Number.POSITIVE_INFINITY,
+				keepVerbatimTokens: settings.keepVerbatimTokens,
+				minElideTokens: settings.minElideTokens,
+			},
+			ctx,
+			config.compressModel,
+		);
+		// Never apply a late summary to a different session, model or projection.
+		if (
+			epoch !== projectionEpoch || lastRequest !== request ||
+			!ctx.model || modelKey(ctx.model) !== request.model
+		) return;
+		if (plan.summaryError && !summaryWarnedThisRun) {
+			summaryWarnedThisRun = true;
+			const hint = config.compressModel !== undefined
+				? " Check compressModel and that model's login."
+				: "";
+			notify(ctx, `tool-output summary failed; original output kept.${hint}`, "warning");
+		}
+		if (!plan.changed) return;
+		request.trimmed = true;
+		if (plan.elidedNow > 0 && !notifiedThisRun) {
+			notifiedThisRun = true;
+			notify(
+				ctx,
+				`context reached ${Math.round(decision.percent * 100)}% of the ` +
+					`${decision.window.toLocaleString("en-US")}-token window mid-run; older tool output is ` +
+					"being replaced by cached summaries in requests. Nothing was removed from the transcript.",
+				"info",
+			);
+		}
+		return { messages: plan.messages as unknown as typeof event.messages };
+	});
+
+	pi.on("message_end", (event, ctx) => {
+		if (!config.contextGuard.enabled) return;
+		// The last context hook precedes the response and its tool results. Include
+		// those newly appended messages without learning overhead from generated output.
+		if (lastRequest && ctx.model && lastRequest.model === modelKey(ctx.model)) {
+			lastRequest.appendedTokens += estimateMessageTokens(
+				event.message as unknown as GuardMessage,
+			);
+		}
+		const usage =
+			event.message.role === "assistant" ? event.message.usage : undefined;
+		if (usage) llmCalls++;
+		if (llmCalls >= 5) {
+			if (!hookSeen) {
+				warn(
+					ctx,
+					"hook_missing",
+					"the context guard is NOT running: this Pi build no longer calls the pre-request hook it " +
+						"needs, so long autonomous runs are unprotected against context overflow again. Check for an extension update.",
+				);
+			} else if (!windowSeen) {
+				warn(
+					ctx,
+					"window_unknown",
+					`the context guard is standing down on ${ctx.model?.provider}/${ctx.model?.id}: Pi does not ` +
+						"know this model's context window, so there is nothing to measure against. Give the model a contextWindow in models.json to switch the guard back on.",
+				);
+			}
+		}
+		if (
+			!usage ||
+			!lastRequest ||
+			lastRequest.trimmed ||
+			!ctx.model ||
+			lastRequest.model !== modelKey(ctx.model)
+		)
+			return;
+		const reported =
+			Number(usage.input ?? 0) +
+			Number(usage.cacheRead ?? 0) +
+			Number(usage.cacheWrite ?? 0);
+		if (reported > 0) trackerFor(ctx).observe(lastRequest.raw, reported);
+	});
+
+	pi.on("agent_start", () => {
+		agentRunning = true;
+		notifiedThisRun = false;
+		summaryWarnedThisRun = false;
+		summaryGuard.beginRun();
 	});
 
 	pi.on("model_select", (event, ctx) => {
+		resetProjection();
 		updateStatus(ctx);
 		const percent = percentFor(event.model);
 		const threshold = thresholdFor(event.model.contextWindow, percent);
 		if (event.source !== "restore" && ctx.hasUI) {
 			const scope =
-				config.models[modelKey(event.model)] === undefined ? "默认" : "模型专用";
+				config.models[modelKey(event.model)] === undefined
+					? "默认"
+					: "模型专用";
 			ctx.ui.notify(
 				`已应用${scope}阈值 ${percent}%：${threshold.toLocaleString()} / ${event.model.contextWindow.toLocaleString()} tokens`,
 				"info",
@@ -152,12 +357,20 @@ export default function (pi: ExtensionAPI) {
 
 	// 等待 Agent 完全结束（包括工具调用、重试和后续消息）后再 compact，
 	// 避免在连续工具调用过程中打断任务。
-	pi.on("agent_settled", (_event, ctx) => compactIfNeeded(ctx));
+	pi.on("agent_settled", (_event, ctx) => {
+		agentRunning = false;
+		compactIfNeeded(ctx);
+	});
+	pi.on("session_before_compact", () => {
+		externalCompacting = true;
+		resetProjection();
+	});
 	pi.on("session_compact", () => {
-		compacting = false;
+		externalCompacting = false;
+		resetProjection();
 	});
 	pi.on("session_compact_failed", () => {
-		compacting = false;
+		externalCompacting = false;
 	});
 
 	pi.registerCommand("autocompact-percent", {
@@ -208,7 +421,8 @@ export default function (pi: ExtensionAPI) {
 				try {
 					saveConfig();
 				} catch (error) {
-					const message = error instanceof Error ? error.message : String(error);
+					const message =
+						error instanceof Error ? error.message : String(error);
 					ctx.ui.notify(`保存失败：${message}`, "error");
 					return;
 				}
@@ -228,7 +442,8 @@ export default function (pi: ExtensionAPI) {
 				try {
 					saveConfig();
 				} catch (error) {
-					const message = error instanceof Error ? error.message : String(error);
+					const message =
+						error instanceof Error ? error.message : String(error);
 					ctx.ui.notify(`保存失败：${message}`, "error");
 					return;
 				}
