@@ -8,6 +8,7 @@ import test from "node:test";
 import { typescriptNodeArgs } from "./node-typescript.ts";
 import multiAccount from "../index.ts";
 import { placeholderKeyFor } from "../slot-proxy.ts";
+import subagentProvider from "../subagent-provider.ts";
 
 // Capture only discovery registration, without running the parent's session machinery.
 test("discovery advertises Codex and Antigravity provider-only entrypoint", () => {
@@ -37,6 +38,7 @@ const host = fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent"
 const storage = pathToFileURL(join(dirname(host), "core/auth-storage.js")).href;
 const entrypoint = new URL("../subagent-provider.ts", import.meta.url).href;
 
+for (const protocol of ["loadout", "role-run"] as const) {
 for (const { provider, overlay, route, ownedKey, direct } of [
   { provider: "openai-codex", overlay: true },
   { provider: "openai-codex-account-2", overlay: true },
@@ -49,13 +51,15 @@ for (const { provider, overlay, route, ownedKey, direct } of [
   { provider: "openai-codex-account-2", overlay: true, route: "http://proxy.example/openai-codex-account-2", ownedKey: true },
   { provider: "openai-codex-account-2", overlay: true, route: "http://127.0.0.1:9999/openai-codex-account-2/extra", ownedKey: true },
 ]) {
-  test(`fresh child registers only ${provider} (${route ?? (overlay ? "proxy overlay" : "default catalog")}; owned key ${!!ownedKey})`, () => {
+  test(`fresh ${protocol} child registers only ${provider} (${route ?? (overlay ? "proxy overlay" : "default catalog")}; owned key ${!!ownedKey})`, () => {
     const root = mkdtempSync(join(tmpdir(), "pmacct-child-"));
     const configuredUrl = route ?? "http://127.0.0.1:9999/backend-api";
     const expectedUrl = !overlay || direct ? "https://chatgpt.com/backend-api" : configuredUrl;
     const modelId = direct ? "gpt-live-child-test" : "gpt-5.4";
     try {
-      writeFileSync(join(root, "loadout.json"), JSON.stringify({ model: `${provider}/${modelId}` }));
+      const model = `${provider}/${modelId}`;
+      const inputPath = join(root, "input.json");
+      writeFileSync(inputPath, JSON.stringify(protocol === "role-run" ? { plan: { model } } : { model }));
       const driver = `
 import assert from 'node:assert/strict';
 import { ModelRuntime } from ${JSON.stringify(pathToFileURL(host).href)};
@@ -116,9 +120,13 @@ console.log('child preflight OK');
         baseUrl: configuredUrl, api: "openai-codex-responses", apiKey: ownedKey ? placeholderKeyFor("codex") : "placeholder",
         models: [{ id: modelId, ...(direct ? { baseUrl: configuredUrl, contextWindow: 123456, maxTokens: 1000, reasoning: true, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } } : {}) }],
       } } : {} }));
+      const env = { ...process.env };
+      delete env.PI_RPC_SUBAGENT_LOADOUT;
+      delete env.PI_RPC_SUBAGENT_ROLE_RUN;
+      env[protocol === "role-run" ? "PI_RPC_SUBAGENT_ROLE_RUN" : "PI_RPC_SUBAGENT_LOADOUT"] = inputPath;
       const output = execFileSync(process.execPath, [...typescriptNodeArgs, join(root, "driver.mjs")], {
-        encoding: "utf8", env: { ...process.env, PI_OFFLINE: "1", PI_CODING_AGENT_DIR: root,
-          PI_RPC_SUBAGENT_CHILD: "1", PI_RPC_SUBAGENT_LOADOUT: join(root, "loadout.json"), TEST_MODELS: join(root, "models.json") },
+        encoding: "utf8", env: { ...env, PI_OFFLINE: "1", PI_CODING_AGENT_DIR: root,
+          PI_RPC_SUBAGENT_CHILD: "1", TEST_MODELS: join(root, "models.json") },
       });
       assert.match(output, /child preflight OK/);
     } finally {
@@ -126,3 +134,53 @@ console.log('child preflight OK');
     }
   });
 }
+}
+
+test("child startup validates identity, input and provider for both protocols", () => {
+  const root = mkdtempSync(join(tmpdir(), "pmacct-child-input-"));
+  const keys = ["PI_RPC_SUBAGENT_CHILD", "PI_RPC_SUBAGENT_LOADOUT", "PI_RPC_SUBAGENT_ROLE_RUN"] as const;
+  const previous = keys.map(key => process.env[key]);
+  const registrations: string[] = [];
+  const pi = { registerProvider: (id: string) => { registrations.push(id); } } as unknown as Parameters<typeof subagentProvider>[0];
+  try {
+    for (const key of keys) delete process.env[key];
+    for (const protocol of ["loadout", "role-run"] as const) {
+      const key = protocol === "role-run" ? "PI_RPC_SUBAGENT_ROLE_RUN" : "PI_RPC_SUBAGENT_LOADOUT";
+      const path = join(root, `${protocol}.json`);
+      const writeModel = (model: unknown) => writeFileSync(path, JSON.stringify(protocol === "role-run" ? { plan: { model } } : { model }));
+      process.env[key] = path;
+      writeModel("openai-codex/gpt-5.4");
+      for (const marker of [undefined, "0"]) {
+        if (marker === undefined) delete process.env.PI_RPC_SUBAGENT_CHILD;
+        else process.env.PI_RPC_SUBAGENT_CHILD = marker;
+        assert.throws(() => subagentProvider(pi), /requires an RPC subagent/);
+      }
+      process.env.PI_RPC_SUBAGENT_CHILD = "1";
+      for (const model of [undefined, 42, "anthropic/claude", "openai-codex-account-x/gpt-5.4"]) {
+        writeModel(model);
+        assert.throws(() => subagentProvider(pi), /Unsupported child provider/);
+      }
+      writeFileSync(path, "{");
+      assert.throws(() => subagentProvider(pi), SyntaxError);
+      delete process.env[key];
+      assert.throws(() => subagentProvider(pi), /requires an RPC subagent/);
+    }
+    assert.deepEqual(registrations, []);
+
+    const rolePath = join(root, "role-run.json");
+    writeFileSync(rolePath, JSON.stringify({ model: "antigravity/gemini", plan: { model: "openai-codex-account-2/gpt-5.4" } }));
+    process.env.PI_RPC_SUBAGENT_ROLE_RUN = rolePath;
+    process.env.PI_RPC_SUBAGENT_LOADOUT = join(root, "missing-legacy.json");
+    subagentProvider(pi);
+    assert.deepEqual(registrations, ["openai-codex-account-2"]);
+    writeFileSync(rolePath, JSON.stringify({ model: "openai-codex/gpt-5.4" }));
+    assert.throws(() => subagentProvider(pi), /Unsupported child provider/);
+    assert.deepEqual(registrations, ["openai-codex-account-2"]);
+  } finally {
+    keys.forEach((key, i) => {
+      if (previous[i] === undefined) delete process.env[key];
+      else process.env[key] = previous[i];
+    });
+    rmSync(root, { recursive: true, force: true });
+  }
+});

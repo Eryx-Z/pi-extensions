@@ -5,10 +5,12 @@ import { registerAntigravitySlot, registerCodexChildProvider } from "./provider-
 
 /** Provider-only RPC startup: no tools, account rotation, model restore or UI hooks. */
 export default function subagentProvider(pi: ExtensionAPI) {
-  const path = process.env.PI_RPC_SUBAGENT_LOADOUT;
-  if (process.env.PI_RPC_SUBAGENT_CHILD !== "1" || !path) throw new Error("Provider entrypoint requires an RPC subagent loadout");
-  const loadout = JSON.parse(readFileSync(path, "utf8"));
-  const provider = typeof loadout.model === "string" ? loadout.model.split("/")[0] : "";
+  const roleRunPath = process.env.PI_RPC_SUBAGENT_ROLE_RUN;
+  const path = roleRunPath || process.env.PI_RPC_SUBAGENT_LOADOUT;
+  if (process.env.PI_RPC_SUBAGENT_CHILD !== "1" || !path) throw new Error("Provider entrypoint requires an RPC subagent loadout or role run");
+  const input = JSON.parse(readFileSync(path, "utf8"));
+  const model = roleRunPath ? input?.plan?.model : input?.model;
+  const provider = typeof model === "string" ? model.split("/")[0] : "";
   if (/^antigravity(?:-account-\d+)?$/.test(provider)) {
     registerAntigravitySlot(pi, provider);
   } else if (/^openai-codex(?:-account-\d+)?$/.test(provider)) {
