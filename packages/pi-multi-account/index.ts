@@ -175,6 +175,12 @@ import {
 	isCodexFastModel,
 	shapeCodexFastPayload,
 } from "./codex-fast.ts";
+import {
+	writeXaiFastEnabled,
+	readXaiFastEnabled,
+	isXaiFastModel,
+	shapeXaiFastPayload,
+} from "./xai-fast.ts";
 import { preserveInterruptedTurns } from "./interrupted-turns.ts";
 import { cooldownFromHeaders, cooldownFromErrorText, cooldownMsFromUsage } from "./cooldown.ts";
 import {
@@ -4997,9 +5003,35 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				await handleGrokFast(pi, ctx, fastArgs[1]?.toLowerCase());
 				return;
 			}
+			if (fastArgs[0]?.toLowerCase() === "xai") {
+				const xaiAction = (fastArgs[1] ?? "status").toLowerCase();
+				if (xaiAction !== "on" && xaiAction !== "off" && xaiAction !== "status") {
+					ctx.ui.notify("Usage: /multi-account fast xai on|off|status", "warning");
+					return;
+				}
+				if (xaiAction === "on" || xaiAction === "off") {
+					try {
+						writeXaiFastEnabled(xaiAction === "on");
+					} catch (error) {
+						ctx.ui.notify(
+							`pi-multi-account: could not save xAI fast mode: ${error instanceof Error ? error.message : String(error)}`,
+							"warning",
+						);
+						return;
+					}
+				}
+				const xaiEnabled = readXaiFastEnabled();
+				ctx.ui.notify(
+					xaiEnabled
+						? "pi-multi-account: xAI fast mode ON. xAI subscription requests send service_tier=priority. Priority is billed at a premium."
+						: "pi-multi-account: xAI fast mode OFF. xAI subscription requests omit service_tier.",
+					"info",
+				);
+				return;
+			}
 			const action = ((fastArgs[0]?.toLowerCase() === "codex" ? fastArgs[1] : arg1) ?? "status").toLowerCase();
 			if (action !== "on" && action !== "off" && action !== "status") {
-				ctx.ui.notify("Usage: /multi-account fast [codex|grok] on|off|status", "warning");
+				ctx.ui.notify("Usage: /multi-account fast [codex|xai|grok] on|off|status", "warning");
 				return;
 			}
 			if (action === "on" || action === "off") {
@@ -5298,13 +5330,15 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 					paint("accent", bold(ctx.model ? accountText(ctx.model.provider) : "无")),
 				),
 				field("模型", ctx.model ? ctx.model.id : "无"),
-				...(isCodexFastModel(ctx.model)
+				...(isCodexFastModel(ctx.model) || isXaiFastModel(ctx.model)
 					? [
 							field(
 								"快速",
 								paint(
-									readCodexFastEnabled() ? "success" : "muted",
-									readCodexFastEnabled()
+									(isXaiFastModel(ctx.model) ? readXaiFastEnabled() : readCodexFastEnabled())
+										? "success"
+										: "muted",
+									(isXaiFastModel(ctx.model) ? readXaiFastEnabled() : readCodexFastEnabled())
 										? "priority · service_tier"
 										: "standard",
 								),
@@ -5610,6 +5644,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				rewriteDeveloperRoleToSystem(payload);
 			}
 			shapeCodexFastPayload(payload, ctx?.model);
+			shapeXaiFastPayload(payload, ctx?.model);
 		}
 		return shaped;
 	});

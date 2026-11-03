@@ -24,6 +24,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **xAI subscription fast mode.** `/fast` on an `xai` or `xai-account-N` model sends `service_tier: "priority"` when enabled, matching xAI Priority Processing. The preference is `xai-fast-mode.json` and defaults to off. It does not replace the model with the grok-cli fast id.
+
 - **Standalone Grok fast mode in parent sessions and RPC subagents.** Bundled MIT-licensed protocol code under `grok/` replaces all runtime imports from `pi-grok-cli`. Includes OAuth login/refresh, existing vault compatibility, catalog, request sanitization and streaming. `/multi-account fast grok on|off|status` selects Grok 4.7 fast/standard without injecting Codex service tiers. No Imagine, dashboard, account rotation or usage UI is loaded.
 
 - **Codex fast mode for rotation slots and RPC subagents.** `openai-codex` and `openai-codex-account-N` requests send `service_tier: "priority"` when fast mode is on, including mesh children that only load `subagent-provider.ts`. The preference is the shared `codex-fast-mode.json` (`enabled`, default on). `/multi-account fast [codex] on|off|status` changes it. No separate fast-mode plugin is required; disable separately installed fast-mode extensions to prevent conflicting hooks.

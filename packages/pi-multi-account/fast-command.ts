@@ -1,13 +1,18 @@
 import type { ExtensionAPI, ExtensionCommandContext } from '@earendil-works/pi-coding-agent';
 import { isCodexFastModel, readCodexFastEnabled, writeCodexFastEnabled } from './codex-fast.ts';
 import { handleGrokFast } from './grok/fast.ts';
+import { isXaiFastModel, readXaiFastEnabled, writeXaiFastEnabled } from './xai-fast.ts';
 
 type FastAction = 'on' | 'off' | 'status';
 
-function currentFast(ctx: ExtensionCommandContext): { kind: 'codex' | 'grok' | 'unsupported'; on: boolean; detail: string } {
+function currentFast(ctx: ExtensionCommandContext): { kind: 'codex' | 'grok' | 'xai' | 'unsupported'; on: boolean; detail: string } {
   if (isCodexFastModel(ctx.model)) {
     const on = readCodexFastEnabled();
     return { kind: 'codex', on, detail: `ChatGPT/Codex priority ${on ? 'ON' : 'OFF'}` };
+  }
+  if (isXaiFastModel(ctx.model)) {
+    const on = readXaiFastEnabled();
+    return { kind: 'xai', on, detail: `xAI priority ${on ? 'ON' : 'OFF'} (${ctx.model?.id ?? 'xai'})` };
   }
   if (ctx.model?.provider === 'grok-cli' && ['grok-4.7', 'grok-4.7-build-fast'].includes(ctx.model.id)) {
     const on = ctx.model.id === 'grok-4.7-build-fast';
@@ -31,7 +36,7 @@ export async function handleFastCommand(pi: ExtensionAPI, args: string, ctx: Ext
   }
   const state = currentFast(ctx);
   if (state.kind === 'unsupported') {
-    ctx.ui.notify('/fast 只支持当前的 ChatGPT/Codex 或 Grok 4.7。请先选择支持的模型。', 'warning');
+    ctx.ui.notify('/fast 只支持当前的 ChatGPT/Codex、xAI 订阅或 grok-cli 的 Grok 4.7。请先选择支持的模型。', 'warning');
     return;
   }
   const action = (requested || await askAction(ctx, state)) as FastAction | undefined;
@@ -46,10 +51,19 @@ export async function handleFastCommand(pi: ExtensionAPI, args: string, ctx: Ext
       return;
     }
   }
-  if (state.kind === 'codex') {
+  if (state.kind === 'xai' && action === 'on') {
+    const ok = ctx.hasUI ? await ctx.ui.confirm('开启 xAI Priority？', 'service_tier=priority 按更高单价计费。') : true;
+    if (!ok) {
+      ctx.ui.notify('未更改。', 'info');
+      return;
+    }
+  }
+  if (state.kind === 'codex' || state.kind === 'xai') {
+    const write = state.kind === 'codex' ? writeCodexFastEnabled : writeXaiFastEnabled;
+    const label = state.kind === 'codex' ? 'ChatGPT/Codex' : 'xAI';
     try {
-      writeCodexFastEnabled(action === 'on');
-      ctx.ui.notify(`ChatGPT/Codex fast ${action === 'on' ? '已开启（priority）' : '已关闭'}`, 'info');
+      write(action === 'on');
+      ctx.ui.notify(`${label} fast ${action === 'on' ? '已开启（priority）' : '已关闭'}`, 'info');
     } catch (error) {
       ctx.ui.notify(`无法保存：${error instanceof Error ? error.message : String(error)}`, 'warning');
     }
@@ -60,7 +74,7 @@ export async function handleFastCommand(pi: ExtensionAPI, args: string, ctx: Ext
 
 export function registerFastCommand(pi: ExtensionAPI) {
   pi.registerCommand('fast', {
-    description: '开启或关闭当前 ChatGPT/Codex、Grok 4.7 的 fast',
+    description: '开启或关闭当前 ChatGPT/Codex、xAI 订阅、Grok 4.7 的 fast',
     handler: (args, ctx) => handleFastCommand(pi, args, ctx),
   });
 }

@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { handleFastCommand, registerFastCommand } from '../fast-command.ts';
 import { readCodexFastEnabled, writeCodexFastEnabled } from '../codex-fast.ts';
+import { readXaiFastEnabled, writeXaiFastEnabled } from '../xai-fast.ts';
 
 function ctxFor(model: { provider: string; id?: string; api?: string }, ui: Record<string, unknown> = {}) {
   const messages: string[] = [];
@@ -65,4 +66,30 @@ test('/fast confirms costly Grok switch and leaves other models unchanged', asyn
   await handleFastCommand({} as never, 'off', other.ctx as never);
   assert.match(other.messages.at(-1)!, /支持的模型/);
   registerFastCommand({ registerCommand(name: string) { assert.equal(name, 'fast'); } } as never);
+});
+
+test('/fast toggles xAI priority without changing the model id', async () => {
+  const old = process.env.PI_CODING_AGENT_DIR;
+  const root = mkdtempSync(join(tmpdir(), 'fast-xai-'));
+  process.env.PI_CODING_AGENT_DIR = root;
+  writeXaiFastEnabled(false);
+  try {
+    const declined = ctxFor({ provider: 'xai', id: 'grok-4.7', api: 'openai-responses' }, { confirm: async () => false });
+    await handleFastCommand({} as never, 'on', declined.ctx as never);
+    assert.equal(readXaiFastEnabled(), false);
+    assert.match(declined.messages.at(-1)!, /未更改/);
+
+    const enabled = ctxFor({ provider: 'xai', id: 'grok-4.7', api: 'openai-responses' }, { confirm: async () => true });
+    await handleFastCommand({} as never, 'on', enabled.ctx as never);
+    assert.equal(readXaiFastEnabled(), true);
+    assert.match(enabled.messages.at(-1)!, /xAI fast 已开启/);
+
+    const slot = ctxFor({ provider: 'xai-account-2', id: 'grok-4.7', api: 'openai-responses' });
+    await handleFastCommand({} as never, 'off', slot.ctx as never);
+    assert.equal(readXaiFastEnabled(), false);
+    assert.equal(readCodexFastEnabled(), true);
+  } finally {
+    if (old === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = old;
+    rmSync(root, { recursive: true, force: true });
+  }
 });
