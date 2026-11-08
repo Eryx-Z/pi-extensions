@@ -53,6 +53,9 @@ export type AntigravityApi = typeof ANTIGRAVITY_API;
 
 export type AntigravityStreamOptions = Omit<SimpleStreamOptions, "toolChoice"> & {
   toolChoice?: ToolChoice | `${ToolChoice}`;
+  /** Private per-account discovery state, supplied by the slot provider. */
+  modelRouting?: Record<string, AntigravityRouting>;
+  modelEnums?: Record<string, string>;
 };
 
 export type GeminiTextPart = { text: string; thoughtSignature?: string };

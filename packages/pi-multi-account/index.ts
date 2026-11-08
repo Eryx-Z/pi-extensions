@@ -51,6 +51,7 @@ import {
 import { join, dirname } from "node:path";
 import {
 	type UsageSnapshot,
+	type UsageWindow,
 	usageFamily,
 	formatUsageStatus,
 	usageColor,
@@ -160,7 +161,7 @@ import {
 	setupCursorSubscription,
 	CURSOR_PROXY_PLACEHOLDER_KEY,
 } from "./cursor-bridge.ts";
-import { formatSlotDisplayName } from "./account-display.ts";
+import { formatSlotDisplayName, slotAccountDetails } from "./account-display.ts";
 import {
 	comparePriority,
 	normalizeGroup,
@@ -991,7 +992,74 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		}
 	}
 
+	function snapshotMatchesAuth(
+		snapshot: UsageSnapshot | undefined,
+		entry: AuthEntry | undefined,
+	): snapshot is UsageSnapshot {
+		if (!snapshot || !entry) return false;
+		const currentHash = credentialHash(entry);
+		if (snapshot.credentialHash && snapshot.credentialHash === currentHash)
+			return true;
+		const refreshable =
+			typeof entry.refresh === "string" && entry.refresh.length > 0;
+		if (!refreshable) return false;
+		if (
+			typeof snapshot.account === "string" &&
+			snapshot.account.trim() &&
+			typeof entry.email === "string" &&
+			entry.email.trim()
+		) {
+			return (
+				snapshot.account.trim().toLowerCase() ===
+				entry.email.trim().toLowerCase()
+			);
+		}
+		return false;
+	}
+
+	const clearedCatalogProviders = new Set<string>();
+
+	function mergeDiskUsageSnapshots(auth = readAuthFile()) {
+		const diskState = loadState();
+		const diskUsage = diskState.usageByProvider;
+		if (diskUsage) {
+			for (const [provider, diskSnapshot] of Object.entries(diskUsage)) {
+				if (!snapshotMatchesAuth(diskSnapshot, auth[provider])) continue;
+				const localSnapshot = usageByProvider.get(provider);
+				if (
+					!localSnapshot ||
+					(diskSnapshot.fetchedAt ?? 0) > (localSnapshot.fetchedAt ?? 0)
+				) {
+					usageByProvider.set(
+						provider,
+						preserveKnownPlan(diskSnapshot, localSnapshot),
+					);
+				}
+			}
+		}
+		const diskCatalogs = diskState.codexModelCatalogByProvider;
+		if (diskCatalogs) {
+			for (const [provider, diskCatalog] of Object.entries(diskCatalogs)) {
+				if (
+					clearedCatalogProviders.has(provider) ||
+					!auth[provider] ||
+					!Array.isArray(diskCatalog?.models)
+				) {
+					continue;
+				}
+				const localCatalog = codexModelCatalogByProvider.get(provider);
+				if (
+					!localCatalog ||
+					(diskCatalog.fetchedAt ?? 0) > (localCatalog.fetchedAt ?? 0)
+				) {
+					codexModelCatalogByProvider.set(provider, diskCatalog);
+				}
+			}
+		}
+	}
+
 	function persist(extra?: Partial<ProviderFailoverState>) {
+		mergeDiskUsageSnapshots();
 		persistedState = {
 			...persistedState,
 			...extra,
@@ -1010,6 +1078,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			),
 		};
 		saveState(persistedState);
+		clearedCatalogProviders.clear();
 	}
 
 	// ----- invalidation (dead authorization) --------------------------------
@@ -1375,6 +1444,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	async function syncCodexModelCatalog(ctx: any, force = false) {
 		if (!config.autoDiscoverModels) return;
 		const auth = readAuthFile();
+		mergeDiskUsageSnapshots(auth);
 		const duplicateIds = new Set(
 			discoverDuplicateSlots(auth).map(({ duplicate }) => duplicate),
 		);
@@ -1449,6 +1519,49 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		// Catalogs just changed while some providers may be hidden by only-active. Re-apply the
 		// filter NOW so the stored hidden copies hold the FRESH lists — otherwise a manual switch
 		// that lands before the next message_start would restore the stale pre-sync models.
+		applyOnlyActiveFilter(ctx);
+	}
+
+	/** Refresh AGY through the host so OAuth refresh and catalog persistence stay provider-scoped. */
+	async function syncAntigravityModelCatalog(ctx: any, force = false) {
+		if (!config.autoDiscoverModels || !ctx?.modelRegistry?.refresh) return;
+		const auth = readAuthFile();
+		const providers = Object.keys(auth).filter((provider) =>
+			/^antigravity(?:-account-\d+)?$/.test(provider) && isEntryUsable(auth[provider]),
+		);
+		if (!providers.length) return;
+		let allowNetwork = true;
+		if (!force) {
+			try {
+				const storePath = join(AGENT_DIR, "models-store.json");
+				if (existsSync(storePath)) {
+					const store = JSON.parse(readFileSync(storePath, "utf8"));
+					const now = Date.now();
+					const ttlMs = 4 * 60 * 60 * 1000;
+					if (
+						providers.every((provider) => {
+							const checkedAt = store?.[provider]?.["pi-antigravity"]?.checkedAt;
+							return typeof checkedAt === "number" && now - checkedAt < ttlMs;
+						})
+					) {
+						allowNetwork = false;
+					}
+				}
+			} catch {
+				// Fall back to live refresh if models-store.json cannot be read.
+			}
+		}
+		const result = await ctx.modelRegistry.refresh({
+			providers, allowNetwork, force, signal: AbortSignal.timeout(20_000),
+		});
+		for (const [provider, error] of result?.errors ?? []) {
+			logEvent("antigravity_catalog_error", { provider, error: String(error) });
+			if (force) ctx.ui?.notify?.(`AGY model refresh failed (${provider}): ${String(error)}`, "warning");
+		}
+		// Only-active may have stored empty registrations. Restore from the slot's
+		// freshly updated controller before re-hiding, not from its old hidden copy.
+		for (const provider of providers) registerAntigravitySlot(pi, provider);
+		emitModelCatalogSnapshot(ctx);
 		applyOnlyActiveFilter(ctx);
 	}
 
@@ -1822,6 +1935,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				// the middle of a streaming request. The five-minute catalog TTL keeps this sweep cheap.
 				if (ctx?.isIdle?.() !== false) await syncCodexModelCatalog(ctx);
 				if (ctx?.isIdle?.() !== false) await syncOllamaModelCatalog(ctx);
+				if (ctx?.isIdle?.() !== false) await syncAntigravityModelCatalog(ctx);
 			});
 		}, config.usageStatusRefreshMs);
 		(usageStatusTimer as any).unref?.();
@@ -2683,7 +2797,10 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				if (exhaustedUntilByProvider.delete(provider)) cooldownsCleared = true;
 				// Model availability is account/plan-specific. Never let a newly logged-in account
 				// inherit the previous account's five-minute catalog snapshot for this slot.
-				if (codexModelCatalogByProvider.delete(provider)) cooldownsCleared = true;
+				if (codexModelCatalogByProvider.delete(provider)) {
+					clearedCatalogProviders.add(provider);
+					cooldownsCleared = true;
+				}
 				// A different real account also clears any stale 401-streak tracking: the new
 				// account's credentials are unrelated to the old failures.
 				authFailures.delete(provider);
@@ -2703,11 +2820,23 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			// can still accumulate toward the kill threshold. Rate-limit cooldowns are NOT
 			// cleared here (they are server-side limits tied to the account, not the token).
 			if (previousHash && nextHash !== previousHash) {
-				usageByProvider.delete(provider);
-				usageErrors.delete(provider);
 				const refreshable =
 					!!entry && typeof entry.refresh === "string" && entry.refresh.length > 0;
+				const sameKnownAccount =
+					refreshable &&
+					Boolean(
+						previousIdentity &&
+							nextIdentity &&
+							previousIdentity === nextIdentity,
+					);
+				if (!sameKnownAccount) {
+					if (usageByProvider.delete(provider)) cooldownsCleared = true;
+				}
+				usageErrors.delete(provider);
 				if (!refreshable) authFailures.delete(provider);
+			} else if (!entry && usageByProvider.has(provider)) {
+				if (usageByProvider.delete(provider)) cooldownsCleared = true;
+				usageErrors.delete(provider);
 			}
 			if (nextHash) credentialHashes.set(provider, nextHash);
 			else credentialHashes.delete(provider);
@@ -4506,6 +4635,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				await refreshRotationUsage(ctx);
 				await syncCodexModelCatalog(ctx, true);
 				await syncOllamaModelCatalog(ctx, true);
+				await syncAntigravityModelCatalog(ctx, true);
 			});
 			ctx.ui.notify(
 				"pi-multi-account: config reloaded and accounts re-discovered",
@@ -4522,6 +4652,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				await refreshRotationUsage(ctx);
 				await syncCodexModelCatalog(ctx, true);
 				await syncOllamaModelCatalog(ctx, true);
+				await syncAntigravityModelCatalog(ctx, true);
 			});
 			ctx.ui.notify(
 				`pi-multi-account: rediscovered accounts${changed ? "" : " (no auth.json change)"}. Rotation: ${rotation.join(" → ") || "none"}`,
@@ -5176,6 +5307,8 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		}
 
 		refreshDiscovery(false, ctx);
+		const statusAuth = readAuthFile();
+		mergeDiskUsageSnapshots(statusAuth);
 		if (command === "status") {
 			// Status is an interactive inspection path: render the best cached snapshot immediately
 			// instead of making the UI wait for the slowest provider. Refresh stale accounts in the
@@ -5191,13 +5324,15 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		// A child launched without an explicit model uses the startup default in settings.json;
 		// report when that default cannot authenticate rather than pretending it tracks the live
 		// rotation account.
-		const childView = slotsAsAChildSeesThem(rotation, readAuthFile());
+		const childView = slotsAsAChildSeesThem(rotation, statusAuth);
 		const childUnusable = childView.filter((verdict) => !verdict.usable);
 		const childRouteWarning = defaultRouteWarning(
 			readHostDefaultModel()?.provider,
-			(slotId) => slotsAsAChildSeesThem([slotId], readAuthFile())[0],
+			(slotId) => slotsAsAChildSeesThem([slotId], statusAuth)[0],
 		);
-		const currentUsage = ctx.model ? cachedUsage(ctx.model.provider) : undefined;
+		const currentUsage = ctx.model
+			? (cachedUsage(ctx.model.provider) ?? usageByProvider.get(ctx.model.provider))
+			: undefined;
 		const cooldowns = [...exhaustedUntilByProvider.entries()]
 			.filter(([p, until]) => until > Date.now() && !isInvalidated(p))
 			.map(([p, until]) => `${p}: ${formatUntil(until)}`);
@@ -5246,20 +5381,47 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 						return provider.replace(/-account-\d+$/, "");
 				}
 			};
+			const fallbackAuthDetails = (
+				provider: string,
+				planHint?: string,
+			): { email?: string; plan?: string } => {
+				const entry = statusAuth[provider];
+				if (!entry) return {};
+				const details = slotAccountDetails(
+					provider,
+					entry,
+					classifyProvider(provider, config.qwenProvider) ?? "openai-codex",
+					planHint,
+				);
+				const email =
+					details.account && details.account.includes("@")
+						? details.account
+						: undefined;
+				return { email, plan: details.plan };
+			};
 			const titleCase = (value: string | undefined) =>
 				value ? value.charAt(0).toUpperCase() + value.slice(1) : "订阅未知";
 			const snapshotFor = (provider: string) =>
 				cachedUsage(provider) ?? usageByProvider.get(provider);
 			const accountText = (provider: string) => {
 				const snapshot = snapshotFor(provider);
-				const account = snapshot?.account ?? providerName(provider);
-				return `${account}: ${titleCase(snapshot?.plan)}`;
+				const fallback = fallbackAuthDetails(provider, snapshot?.plan);
+				const account =
+					snapshot?.account ?? fallback.email ?? providerName(provider);
+				const plan = snapshot?.plan ?? fallback.plan;
+				return `${account}: ${titleCase(plan)}`;
 			};
-			const limitsText = (snapshot: UsageSnapshot | undefined) => {
+			const limitsText = (
+				snapshot: UsageSnapshot | undefined,
+				provider?: string,
+			) => {
 				if (!snapshot) {
-					return ctx.model && usageFamily(ctx.model.provider) === "qwen"
-						? qwenLiveStatus(ctx.model.provider)
-						: "尚未加载";
+					const target = provider ?? ctx.model?.provider;
+					if (target && usageFamily(target) === "qwen") {
+						return qwenLiveStatus(target);
+					}
+					const err = target ? usageErrors.get(target) : undefined;
+					return err ? `加载失败: ${err}` : "尚未加载";
 				}
 				const display = displayUsageSnapshot(snapshot);
 				const parts: string[] = [];
@@ -5268,16 +5430,39 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				else if (display.serviceable === false) parts.push("已用尽");
 
 				if (display.family === "antigravity") {
-					// Only surface Gemini quota for Antigravity, keeping it on a single row exactly matching Codex.
-					const gemini = display.modelQuotas?.["Gemini"];
-					const geminiPrimary = gemini?.primary ?? (display.primary?.windowSeconds === 18000 ? display.primary : undefined);
-					const geminiSecondary = gemini?.secondary ?? (display.primary?.windowSeconds === 604800 ? display.primary : undefined);
-					if (geminiPrimary) {
-						parts.push(`5h 剩余 ${remainingPercent(geminiPrimary)}% · ${formatResetDuration(geminiPrimary.resetAt)} 后重置`);
-					}
-					if (geminiSecondary) {
-						parts.push(`7d 剩余 ${remainingPercent(geminiSecondary)}% · ${formatResetDuration(geminiSecondary.resetAt)} 后重置`);
-					}
+					const formatPool = (
+						label: string,
+						pool: { primary?: UsageWindow; secondary?: UsageWindow } | undefined,
+						legacyWindow: UsageWindow | undefined,
+					) => {
+						const w5h =
+							pool?.primary ??
+							(legacyWindow?.windowSeconds === 18000 ? legacyWindow : undefined);
+						const w7d =
+							pool?.secondary ??
+							(legacyWindow?.windowSeconds === 604800 ? legacyWindow : undefined);
+						const windows: string[] = [];
+						if (w5h) windows.push(`5h ${remainingPercent(w5h)}%`);
+						if (w7d) windows.push(`7d ${remainingPercent(w7d)}%`);
+						if (windows.length === 0 && legacyWindow) {
+							windows.push(`5h ${remainingPercent(legacyWindow)}%`);
+						}
+						return windows.length > 0
+							? `${label} ${windows.join(" / ")}`
+							: undefined;
+					};
+					const geminiText = formatPool(
+						"Gemini",
+						display.modelQuotas?.["Gemini"],
+						display.primary,
+					);
+					const claudeText = formatPool(
+						"Claude",
+						display.modelQuotas?.["Claude"],
+						display.secondary,
+					);
+					if (geminiText) parts.push(geminiText);
+					if (claudeText) parts.push(claudeText);
 				} else {
 					for (const [position, window] of [
 						["primary", display.primary],
@@ -5316,7 +5501,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 					isCurrent
 						? paint("accent", bold(accountText(provider)))
 						: bold(accountText(provider))
-				}${isCurrent ? paint("muted", "  当前") : ""}\n    ${paint(color, limitsText(snapshot))}`;
+				}${isCurrent ? paint("muted", "  当前") : ""}\n    ${paint(color, limitsText(snapshot, provider))}`;
 			});
 			const statusLines = [
 				paint("accent", bold(`pi-multi-account v${VERSION}`)) +
@@ -6049,18 +6234,47 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			`pi-multi-account v${VERSION} loaded (${config.enabled ? "enabled" : "disabled"}). ${rotation.length} account(s) in rotation. Config: ${CONFIG_PATH}`,
 			"info",
 		);
-		// Refresh every account BEFORE deciding the selected model is unavailable. Otherwise a
-		// plan upgrade can revive the current account milliseconds after startup preflight has
-		// already switched away from it using the old plan's stale 100% snapshot.
-		await refreshRotationUsage(ctx);
-		await syncCodexModelCatalog(ctx);
-		await syncOllamaModelCatalog(ctx);
-		// Pi restores the session model BEFORE extension catalogs finish registering
-		// unless the factory returned the Cursor setup promise. Re-apply anyway: a
-		// cold catalog, a compaction inner session, or a git-reset leftover can still
-		// leave getModel(cursor, grok-4.6) empty.
-		if (cursorReady) await cursorReady.catch(() => undefined);
-		// Cursor slot catalogs changed too — same stale-hidden-copy repair as the model syncs.
+		// Run quota and catalog syncs in parallel with a short startup budget so warm caches and
+		// fast local responses settle before preflight, while slow remote endpoints never freeze
+		// Pi startup or /reload for seconds. Any remaining network work finishes in the background.
+		const initialModelRef = ctx.model
+			? ref(ctx.model.provider, ctx.model.id)
+			: undefined;
+		const startupTarget =
+			intendedStartupModel() ??
+			(ctx.model
+				? { provider: ctx.model.provider, id: ctx.model.id }
+				: undefined);
+		const startupTargetHealthy =
+			!!startupTarget &&
+			!isInvalidated(startupTarget.provider) &&
+			Boolean(usageByProvider.get(startupTarget.provider)) &&
+			providerRecoveryAt(startupTarget.provider) <= Date.now();
+		// Restore persisted local AGY catalogs (~1 ms when warm) before model restoration so
+		// dynamically discovered IDs like gemini-4-argon resolve immediately on 0 ms fast-start.
+		const agCatalogSync = syncAntigravityModelCatalog(ctx);
+		if (startupTargetHealthy) {
+			await Promise.race([
+				agCatalogSync,
+				new Promise<void>((resolve) => setImmediate(resolve)),
+			]);
+		}
+		const startupSync = Promise.all([
+			refreshRotationUsage(ctx),
+			syncCodexModelCatalog(ctx),
+			syncOllamaModelCatalog(ctx),
+			agCatalogSync,
+			...(cursorReady ? [cursorReady.catch(() => undefined)] : []),
+		]);
+		const settledWithinBudget = await Promise.race([
+			startupSync.then(() => true),
+			startupTargetHealthy
+				? new Promise<false>((resolve) => setImmediate(() => resolve(false)))
+				: new Promise<false>((resolve) => {
+						const timer = setTimeout(() => resolve(false), 120);
+						(timer as any).unref?.();
+					}),
+		]);
 		applyOnlyActiveFilter(ctx);
 		emitModelCatalogSnapshot(ctx);
 		await restoreRememberedModel(ctx);
@@ -6068,7 +6282,30 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			ctx,
 			"startup preflight: selected account unavailable",
 		);
+		const postStartupModelRef = ctx.model
+			? ref(ctx.model.provider, ctx.model.id)
+			: undefined;
 		startUsageStatusTimer(ctx);
+		if (!settledWithinBudget) {
+			runBackground("startup background sync", ctx, async () => {
+				await startupSync;
+				if (modelCatalogContext !== ctx) return;
+				applyOnlyActiveFilter(ctx);
+				emitModelCatalogSnapshot(ctx);
+				if (ctx?.isIdle?.() === false) return;
+				const currentRef = ctx.model
+					? ref(ctx.model.provider, ctx.model.id)
+					: undefined;
+				if (currentRef === postStartupModelRef || currentRef === initialModelRef) {
+					await restoreRememberedModel(ctx);
+					await ensureReadyModel(
+						ctx,
+						"startup background preflight: selected account unavailable",
+					);
+				}
+				updateUsageStatus(ctx);
+			});
+		}
 	});
 
 	// CRITICAL: when the current session ends — for ANY reason (quit, reload, or replacement

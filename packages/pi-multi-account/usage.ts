@@ -56,10 +56,19 @@ export type UsageSnapshot = {
 };
 
 export function preserveKnownPlan(snapshot: UsageSnapshot, previous?: UsageSnapshot): UsageSnapshot {
-	if (snapshot.family !== "antigravity" || !snapshot.planWarning || snapshot.plan ||
-		!snapshot.credentialHash || snapshot.credentialHash !== previous?.credentialHash ||
-		snapshot.provider !== previous.provider || snapshot.account !== previous.account ||
-		!previous.plan || previous.plan === "subscription") return snapshot;
+	if (!previous || snapshot.family !== "antigravity" || !snapshot.planWarning || snapshot.plan ||
+		snapshot.provider !== previous.provider || !previous.plan || previous.plan === "subscription") {
+		return snapshot;
+	}
+	const hasAccount = typeof snapshot.account === "string" && snapshot.account.trim().length > 0;
+	const sameAccount = hasAccount
+		? snapshot.account === previous.account
+		: Boolean(
+				!previous.account &&
+				snapshot.credentialHash &&
+				snapshot.credentialHash === previous.credentialHash,
+			);
+	if (!sameAccount) return snapshot;
 	return { ...snapshot, plan: previous.plan };
 }
 
@@ -635,7 +644,11 @@ async function fetchAntigravityUsageSnapshot(
 						if (!gemini5h || fraction < gemini5h.fraction) {
 							gemini5h = { fraction, resetTime };
 						}
-					} else if (id.startsWith("claude-") || id.startsWith("claude_")) {
+					} else if (
+						id.startsWith("claude-") ||
+						id.startsWith("claude_") ||
+						id.startsWith("gpt-oss")
+					) {
 						if (!claude5h || fraction < claude5h.fraction) {
 							claude5h = { fraction, resetTime };
 						}
@@ -1164,18 +1177,32 @@ export function formatUsageDetails(
 			lines.push(`Status: ${snapshot.plan}`);
 		}
 	}
-	for (const [position, window] of [
-		["primary", snapshot.primary],
-		["secondary", snapshot.secondary],
-	] as const) {
-		if (!window) continue;
-		const label =
-			snapshot.family === "ollama" && position === "primary"
-				? "session"
-				: windowLabel(window, snapshot.family, position);
-		lines.push(
-			`${label}: ${remainingPercent(window)}% left (${Math.round(window.usedPercent)}% used), resets in ${formatResetDuration(window.resetAt, now)} at ${new Date(window.resetAt).toLocaleString()}`,
-		);
+	if (snapshot.family === "antigravity" && snapshot.modelQuotas) {
+		for (const [poolName, pool] of Object.entries(snapshot.modelQuotas)) {
+			for (const [windowName, window] of [
+				["5h", pool.primary],
+				["7d", pool.secondary],
+			] as const) {
+				if (!window) continue;
+				lines.push(
+					`${poolName} ${windowName}: ${remainingPercent(window)}% left (${Math.round(window.usedPercent)}% used), resets in ${formatResetDuration(window.resetAt, now)} at ${new Date(window.resetAt).toLocaleString()}`,
+				);
+			}
+		}
+	} else {
+		for (const [position, window] of [
+			["primary", snapshot.primary],
+			["secondary", snapshot.secondary],
+		] as const) {
+			if (!window) continue;
+			const label =
+				snapshot.family === "ollama" && position === "primary"
+					? "session"
+					: windowLabel(window, snapshot.family, position);
+			lines.push(
+				`${label}: ${remainingPercent(window)}% left (${Math.round(window.usedPercent)}% used), resets in ${formatResetDuration(window.resetAt, now)} at ${new Date(window.resetAt).toLocaleString()}`,
+			);
+		}
 	}
 	if (snapshot.credits?.unlimited) lines.push("Credits: unlimited");
 	else if (snapshot.credits?.balance !== undefined)
@@ -1191,7 +1218,13 @@ export function formatUsageDetails(
 export function usageColor(
 	snapshot: UsageSnapshot,
 ): "success" | "warning" | "error" {
-	const remaining = [snapshot.primary, snapshot.secondary]
+	const quotaWindows = snapshot.modelQuotas
+		? Object.values(snapshot.modelQuotas).flatMap((pool) => [
+				pool.primary,
+				pool.secondary,
+			])
+		: [];
+	const remaining = [snapshot.primary, snapshot.secondary, ...quotaWindows]
 		.filter((window): window is UsageWindow => !!window)
 		.map(remainingPercent);
 	const lowest = remaining.length > 0 ? Math.min(...remaining) : 100;

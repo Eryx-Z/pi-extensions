@@ -62,7 +62,7 @@ export function isSelectableRuntimeModelId(id: string): boolean {
     return false;
   }
   if (/^(chat_|tab_)/i.test(id)) return false;
-  if (/image/i.test(id)) return false;
+  if (/image/i.test(id) || /-disabled$/i.test(id)) return false;
   return true;
 }
 
@@ -77,6 +77,7 @@ export function resolvedCatalog(
 export function buildAntigravityCatalog(
   rawModels: Record<string, ModelInfoRaw>,
   fallback: AntigravityCatalog,
+  includeFallbackModels = true,
 ): AntigravityCatalog {
   const groups = new Map<string, RuntimeGroup>();
 
@@ -106,7 +107,7 @@ export function buildAntigravityCatalog(
 
   mergeAgentSingletons(groups);
 
-  if (groups.size === 0) return fallback;
+  if (groups.size === 0) return includeFallbackModels ? fallback : { models: [], routing: {} };
 
   const models: ProviderModelConfig[] = [];
   const routing: Record<string, AntigravityRouting> = {};
@@ -114,7 +115,7 @@ export function buildAntigravityCatalog(
   for (const group of groups.values()) {
     const fallbackModel = fallback.models.find((model) => model.id === group.publicId);
     const fallbackRouting = fallback.routing[group.publicId];
-    if (fallbackModel && fallbackRouting) {
+    if (includeFallbackModels && fallbackModel && fallbackRouting) {
       models.push(fallbackModel);
       routing[group.publicId] = fallbackRouting;
       continue;
@@ -125,7 +126,7 @@ export function buildAntigravityCatalog(
     routing[group.publicId] = synthesized.routing;
   }
 
-  for (const fallbackModel of fallback.models) {
+  for (const fallbackModel of includeFallbackModels ? fallback.models : []) {
     if (routing[fallbackModel.id]) continue;
     const fallbackRouting = fallback.routing[fallbackModel.id];
     if (!fallbackRouting) continue;

@@ -197,6 +197,26 @@ function appendTurn(contents: GeminiContent[], role: GeminiRole, parts: GeminiPa
   }
 }
 
+function appendToolResponse(
+  contents: GeminiContent[],
+  part: GeminiFunctionResponsePart,
+  imageParts: GeminiInlineDataPart[],
+): void {
+  const last = contents[contents.length - 1];
+  const canGroup =
+    last?.role === GeminiRole.User && last.parts.some((item) => "functionResponse" in item);
+  if (!last || !canGroup) {
+    appendTurn(contents, GeminiRole.User, [part, ...imageParts]);
+    return;
+  }
+  // Antigravity rejects a tool_use when an image separates its tool_result from
+  // the next one. Keep every function response contiguous, then append images.
+  let insertAt = last.parts.length;
+  while (insertAt > 0 && "inlineData" in last.parts[insertAt - 1]!) insertAt--;
+  last.parts.splice(insertAt, 0, part);
+  last.parts.push(...imageParts);
+}
+
 /** Exported for unit tests. */
 export function convertMessages(
   model: Model<Api>,
@@ -311,7 +331,7 @@ export function convertMessages(
               : {}),
           },
         };
-        appendTurn(contents, GeminiRole.User, [part, ...imageParts]);
+        appendToolResponse(contents, part, imageParts);
       }
     }
   }
@@ -874,6 +894,7 @@ export function buildRequest(
     requestIndex,
     conversationId,
     trajectoryId,
+    modelEnum: options.modelEnums ? options.modelEnums[runtimeModel] ?? null : undefined,
   });
   request.sessionId = options.sessionId || envelope.sessionId;
   request.labels = envelope.labels;
@@ -1336,9 +1357,10 @@ export function streamAntigravity(
       setLastProjectId(projectId);
 
       const effort = opts.reasoning ?? "off";
-      const isKnownModel = model.id in getCurrentAntigravityRouting();
+      const routing = opts.modelRouting ?? getCurrentAntigravityRouting();
+      const isKnownModel = model.id in routing;
       const baseRuntimeModel =
-        antigravityEnv("RUNTIME_MODEL")?.trim() || getAntigravityRequestModelId(model.id, effort);
+        antigravityEnv("RUNTIME_MODEL")?.trim() || getAntigravityRequestModelId(model.id, effort, routing);
 
       let initialRuntimeModel = baseRuntimeModel;
       // Skip pre-flight model discovery for known static models to optimize TTFT latency.

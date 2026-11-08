@@ -53,9 +53,13 @@ for (const failure of ["http", "missing", "network", "json"] as const) {
 		assert.equal(snapshot.primary?.usedPercent, 20);
 		const previous = { ...snapshot, plan: "Pro", planWarning: undefined };
 		assert.equal(preserveKnownPlan(snapshot, previous).plan, "Pro");
-		for (const changed of [{ credentialHash: "other" }, { account: "other" }, { provider: "antigravity-account-2" }, { plan: "subscription" }]) {
+		// Routine 55-minute OAuth access-token rotation on the same email keeps the known plan.
+		assert.equal(preserveKnownPlan(snapshot, { ...previous, credentialHash: "rotated-token" }).plan, "Pro");
+		for (const changed of [{ account: "other" }, { account: undefined }, { provider: "antigravity-account-2" }, { plan: "subscription" }]) {
 			assert.equal(preserveKnownPlan(snapshot, { ...previous, ...changed }).plan, undefined);
 		}
+		const anonymous = { ...snapshot, account: undefined };
+		assert.equal(preserveKnownPlan(anonymous, { ...anonymous, plan: "Pro", planWarning: undefined, credentialHash: "other" }).plan, undefined);
 		const recovered = await fetchSnapshot(mock(async () => Response.json({ currentTier: { name: "Free" } })));
 		assert.equal(preserveKnownPlan(recovered, previous).plan, "Free");
 		assert.equal(recovered.planWarning, undefined);

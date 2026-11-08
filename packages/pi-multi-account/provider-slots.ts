@@ -10,20 +10,30 @@ import {
 	readAuthFile,
 	rejectDuplicateLogin,
 } from "./auth-state.ts";
-import {
-	refreshAntigravityToken,
-	loginAntigravity,
-	getApiKey as getAntigravityApiKey,
-} from "./antigravity/auth/index.js";
+import { lazyStream } from "@earendil-works/pi-ai";
 import { type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { ANTHROPIC_BASE, CODEX_BASE, DEFAULT_QWEN_PROVIDER, OLLAMA_BASE } from "./provider-ids.ts";
 import { formatSlotDisplayName } from "./account-display.ts";
 import { readFileSync } from "node:fs";
 import { MODELS_CONFIG_PATH } from "./agent-paths.ts";
 import { placeholderKeyFor } from "./slot-proxy.ts";
-import { getCurrentAntigravityCatalog } from "./antigravity/models/index.js";
-import { DEFAULT_ENDPOINT } from "./antigravity/client/index.js";
-import { ANTIGRAVITY_API, streamAntigravity } from "./antigravity/stream/index.js";
+import { createAntigravityModelDiscovery } from "./antigravity/models/index.js";
+import { DEFAULT_ENDPOINT, defaultProjectId } from "./antigravity/client/index.js";
+import { ANTIGRAVITY_API } from "./antigravity/types/types.js";
+
+let antigravityAuthPromise: Promise<typeof import("./antigravity/auth/index.js")> | undefined;
+const loadAntigravityAuth = () => (antigravityAuthPromise ??= import("./antigravity/auth/index.js"));
+let antigravityStreamPromise: Promise<typeof import("./antigravity/stream/index.js")> | undefined;
+const loadAntigravityStream = () => (antigravityStreamPromise ??= import("./antigravity/stream/index.js"));
+
+function getAntigravityApiKey(credentials: AuthEntry): string {
+	const email = typeof credentials.email === "string" ? credentials.email : undefined;
+	const projectId =
+		typeof credentials.projectId === "string" && credentials.projectId
+			? credentials.projectId
+			: defaultProjectId(email || "antigravity-default");
+	return JSON.stringify({ token: credentials.access, projectId });
+}
 
 const CODEX_MODEL_DEFS: Record<string, Record<string, unknown>> = {
 	"gpt-5.3-codex-spark": {
@@ -144,8 +154,10 @@ export async function refreshAntigravityCredentials(
 ): Promise<AuthEntry> {
 	if (!credentials.refresh)
 		throw new Error("No refresh token present for antigravity");
-	const refresh = (candidate: AuthEntry) =>
-		refreshAntigravityToken(candidate as any) as Promise<AuthEntry>;
+	const refresh = async (candidate: AuthEntry) => {
+		const { refreshAntigravityToken } = await loadAntigravityAuth();
+		return refreshAntigravityToken(candidate as any) as Promise<AuthEntry>;
+	};
 	const refreshed = providerId
 		? await refreshWithDiskRetry({
 				credentials,
@@ -296,27 +308,24 @@ export function registerCodexChildProvider(pi: ExtensionAPI, id: string) {
  * its own OAuth credential and project id, which `getApiKey` serializes for the
  * stream at request time.
  *
- * Dynamic model discovery remains intentionally disabled here: the upstream
- * catalog module stores one global routing table, whereas a Google plan can give
- * different Antigravity accounts different catalogs. Static models plus the
- * stream's authenticated runtime lookup avoid leaking one account's entitlement
- * into another slot.
+ * Each slot owns its discovered catalog and runtime routing. Different Google
+ * plans must never inherit another slot's models or thinking variants.
  */
 function antigravityOAuthOverride(providerId: string, name: string) {
 	return {
 		name,
 		async login(callbacks: any) {
+			const { loginAntigravity } = await loadAntigravityAuth();
 			return rejectDuplicateLogin(providerId, await loginAntigravity(callbacks));
 		},
 		refreshToken: (credentials: AuthEntry) =>
 			refreshAntigravityCredentials(credentials, providerId),
-		getApiKey: (credentials: AuthEntry) => getAntigravityApiKey(credentials as any),
+		getApiKey: (credentials: AuthEntry) => getAntigravityApiKey(credentials),
 	};
 }
 
-function antigravitySlotModels(): Array<Record<string, unknown>> {
-	return getCurrentAntigravityCatalog().models.map((model) => ({ ...model }));
-}
+// Account display/usage refreshes re-register slots; retain their live catalog.
+const antigravityDiscoveries = new WeakMap<ExtensionAPI, Map<string, ReturnType<typeof createAntigravityModelDiscovery>>>();
 
 export function registerAntigravitySlot(
 	pi: ExtensionAPI,
@@ -326,13 +335,23 @@ export function registerAntigravitySlot(
 	const name =
 		displayName ??
 		formatSlotDisplayName(id, readAuthFile()[id], "antigravity");
+	let slots = antigravityDiscoveries.get(pi);
+	if (!slots) antigravityDiscoveries.set(pi, slots = new Map());
+	let discovery = slots.get(id);
+	if (!discovery) slots.set(id, discovery = createAntigravityModelDiscovery(id));
+	const catalog = discovery;
 	pi.registerProvider(id, {
 		name,
 		baseUrl: DEFAULT_ENDPOINT,
 		api: ANTIGRAVITY_API,
 		oauth: antigravityOAuthOverride(id, name),
-		models: antigravitySlotModels() as any,
-		streamSimple: streamAntigravity,
+		models: catalog.getCatalog().models as any,
+		refreshModels: catalog.refreshModels,
+		streamSimple: (model: any, context: any, options: any) =>
+			lazyStream(model, async () => {
+				const { streamAntigravity } = await loadAntigravityStream();
+				return streamAntigravity(model, context, { ...options, ...catalog.getStreamOptions() });
+			}),
 	} as any);
 }
 

@@ -243,6 +243,8 @@ export function stableAccountFingerprint(entry: AuthEntry): string | undefined {
 	}
 	if (typeof entry.accountId === "string" && entry.accountId.length > 0)
 		return `acct:${hash12(entry.accountId)}`;
+	if (typeof entry.email === "string" && entry.email.trim())
+		return `email:${hash12(entry.email.trim().toLowerCase())}`;
 	if (entry.key) return `key:${hash12(entry.key)}`;
 	return undefined;
 }

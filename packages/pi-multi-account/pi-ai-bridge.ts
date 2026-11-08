@@ -4,6 +4,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
 import { existsSync } from "node:fs";
+import * as hostPiAi from "@earendil-works/pi-ai";
 
 // ---------------------------------------------------------------------------
 // pi-ai OAuth bridge (version-agnostic)
@@ -185,48 +186,70 @@ function adaptLegacyOauthEntry(mod: any): PiAiOauthBridge | undefined {
 	};
 }
 
-/** pi-ai >= 0.80: OAuth lives behind provider factories, with an AuthInteraction API. */
-function adaptProviderFactories(
-	anthropicMod: any,
-	codexMod: any,
-	kimiMod?: any,
+/**
+ * pi-ai >= 0.80: OAuth lives behind provider factories, with an AuthInteraction API.
+ * Resolve each provider module lazily on login/refresh so extension startup never
+ * synchronously parses @anthropic-ai/sdk / @aws-sdk / openai (~110 ms saved).
+ */
+function adaptLazyProviderFactories(
+	root: string,
+	load: (relative: string) => any,
 ): PiAiOauthBridge | undefined {
-	const anthropicOauth = anthropicMod?.anthropicProvider?.()?.auth?.oauth;
-	const codexOauth = codexMod?.openaiCodexProvider?.()?.auth?.oauth;
-	const kimiOauth = kimiMod?.kimiCodingProvider?.()?.auth?.oauth;
+	const anthropicRel = join("providers", "anthropic.js");
+	const codexRel = join("providers", "openai-codex.js");
+	const kimiRel = join("providers", "kimi-coding.js");
 	if (
-		typeof anthropicOauth?.login !== "function" ||
-		typeof anthropicOauth?.refresh !== "function" ||
-		typeof codexOauth?.login !== "function" ||
-		typeof codexOauth?.refresh !== "function"
+		!existsSync(join(root, "dist", anthropicRel)) ||
+		!existsSync(join(root, "dist", codexRel))
 	) {
 		return undefined;
 	}
+	let anthropicOauth: any;
+	let codexOauth: any;
+	let kimiOauth: any;
+	const requireFlow = (rel: string, fnName: string, label: string) => {
+		const oauth = load(rel)?.[fnName]?.()?.auth?.oauth;
+		if (
+			typeof oauth?.login !== "function" ||
+			typeof oauth?.refresh !== "function"
+		) {
+			throw new Error(
+				`pi-multi-account: subscription (OAuth) login is unavailable — ${rel} exposed no ${label} auth.oauth`,
+			);
+		}
+		return oauth;
+	};
+	const getAnthropic = () =>
+		(anthropicOauth ??= requireFlow(anthropicRel, "anthropicProvider", "Anthropic"));
+	const getCodex = () =>
+		(codexOauth ??= requireFlow(codexRel, "openaiCodexProvider", "Codex"));
+	const hasKimi = existsSync(join(root, "dist", kimiRel));
+	const getKimi = () =>
+		(kimiOauth ??= requireFlow(kimiRel, "kimiCodingProvider", "Kimi"));
+
 	return {
 		era: "provider-factories",
 		anthropic: {
-			login: (callbacks) => anthropicOauth.login(toAuthInteraction(callbacks)),
+			login: (callbacks) => getAnthropic().login(toAuthInteraction(callbacks)),
 			refresh: (credentials, signal) =>
-				anthropicOauth.refresh(credentials, signal),
+				getAnthropic().refresh(credentials, signal),
 		},
 		codex: {
 			// The flag is gone from the new shape; both eras of pi-ai's Codex flow use a
 			// local callback server, and Pi only reads this to decide how to present login.
 			usesCallbackServer: true,
-			login: (callbacks) => codexOauth.login(toAuthInteraction(callbacks)),
-			refresh: (credentials, signal) => codexOauth.refresh(credentials, signal),
+			login: (callbacks) => getCodex().login(toAuthInteraction(callbacks)),
+			refresh: (credentials, signal) => getCodex().refresh(credentials, signal),
 			// Identical to what pi-ai <= 0.79's getApiKey did (verified in its source).
 			getApiKey: (credentials) => credentials.access,
 		},
-		kimi:
-			typeof kimiOauth?.login === "function" &&
-			typeof kimiOauth?.refresh === "function"
-				? {
-						login: (callbacks) => kimiOauth.login(toAuthInteraction(callbacks)),
-						refresh: (credentials, signal) => kimiOauth.refresh(credentials, signal),
-						getApiKey: (credentials) => credentials.access,
-					}
-				: undefined,
+		kimi: hasKimi
+			? {
+					login: (callbacks) => getKimi().login(toAuthInteraction(callbacks)),
+					refresh: (credentials, signal) => getKimi().refresh(credentials, signal),
+					getApiKey: (credentials) => credentials.access,
+				}
+			: undefined,
 	};
 }
 
@@ -267,11 +290,7 @@ export function tryLoadPiAiOauth(): PiAiOauthBridge | undefined {
 	}
 	tried.push("dist/oauth.js exports no runtime OAuth helpers (pi-ai >= 0.80)");
 
-	const modern = adaptProviderFactories(
-		load(join("providers", "anthropic.js")),
-		load(join("providers", "openai-codex.js")),
-		load(join("providers", "kimi-coding.js")),
-	);
+	const modern = adaptLazyProviderFactories(root, load);
 	if (modern) {
 		piAiOauthBridge = modern;
 		piAiOauthLoadError = undefined;
@@ -308,6 +327,9 @@ let piAiGetModelFn: ((provider: string, id: string) => any) | null | undefined;
 
 export function piAiGetModel(provider: string, id: string): any {
 	if (piAiGetModelFn === undefined) {
+		if (typeof (hostPiAi as any)?.getModel === "function") {
+			piAiGetModelFn = (hostPiAi as any).getModel;
+		} else {
 		piAiGetModelFn = null;
 		const root = findPiAiRoot();
 		if (root) {
@@ -325,6 +347,7 @@ export function piAiGetModel(provider: string, id: string): any {
 					// Try the next entry point.
 				}
 			}
+		}
 		}
 	}
 	try {

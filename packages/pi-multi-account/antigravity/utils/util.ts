@@ -44,6 +44,8 @@ export function stableUuid(seed: string): string {
 }
 
 export type AntigravityEnvelopeOptions = {
+  /** null deliberately suppresses the shared enum cache for scoped slots. */
+  modelEnum?: string | null;
   isClaude?: boolean;
   isNonGemini?: boolean;
   step?: number;
@@ -119,7 +121,7 @@ export function antigravityRequestEnvelope(
     used_non_gemini_model: nonGeminiLabel,
   };
 
-  const modelEnum = getModelEnum(wireModelId);
+  const modelEnum = options.modelEnum === undefined ? getModelEnum(wireModelId) : options.modelEnum;
   if (modelEnum) {
     labels.model_enum = modelEnum;
   }

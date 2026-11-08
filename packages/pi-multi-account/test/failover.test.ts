@@ -2885,6 +2885,32 @@ test("Antigravity aliases join the rotation and same-family failover", async () 
 	);
 });
 
+test("startup and rediscover refresh authenticated AGY catalogs through the host", async () => {
+	const t = setup({
+		accounts: { antigravity: { type: "oauth", access: "ag-1", refresh: "ag-r1", projectId: "project" } },
+		current: { provider: "antigravity", id: "gemini-3.8-flash" },
+		config: { autoDiscoverModels: true, childProxy: false, fallbacks: ["antigravity"] },
+	});
+	const calls: any[] = [];
+	let refreshed: (() => void) | undefined;
+	t.ctx.modelRegistry.refresh = async (options: any) => {
+		calls.push(options);
+		refreshed?.();
+		return { errors: new Map(), aborted: false };
+	};
+	await t.fire("session_start", { reason: "startup" });
+	assert.deepEqual(calls[0].providers, ["antigravity"]);
+	assert.equal(calls[0].allowNetwork, true);
+	assert.equal(calls[0].force, false);
+	assert.ok(calls[0].signal instanceof AbortSignal);
+	const rediscovered = new Promise<void>((resolve) => { refreshed = resolve; });
+	await t.command("rediscover");
+	await rediscovered;
+	assert.deepEqual(calls[1].providers, ["antigravity"]);
+	assert.equal(calls[1].force, true);
+	await t.fire("session_shutdown");
+});
+
 test("a spare Antigravity OAuth slot is registered for Google login", async () => {
 	const t = setup({
 		accounts: {
@@ -5847,7 +5873,7 @@ test("status is compact by default and points to full diagnostics", async () => 
 	assert.match(fullStatus, /Resume watchdog/);
 });
 
-test("status displays Antigravity Gemini quota in a single row exactly matching Codex", async () => {
+test("status displays Antigravity Gemini and Claude/3P quotas compactly in a single row", async () => {
 	const now = Date.now();
 	const t = setup({
 		accounts: {
@@ -5882,9 +5908,8 @@ test("status displays Antigravity Gemini quota in a single row exactly matching 
 	const status = t.rec.notifies.at(-1) ?? "";
 	assert.match(
 		status,
-		/owner@example\.com: Google AI Pro\s+当前\n {4}可用 {2}│ {2}5h 剩余 100% · [^\n]+ 后重置 {2}│ {2}7d 剩余 77% · [^\n]+ 后重置/,
+		/owner@example\.com: Google AI Pro\s+当前\n {4}可用 {2}│ {2}Gemini 5h 100% \/ 7d 77% {2}│ {2}Claude 5h 89% \/ 7d 95%/,
 	);
-	assert.doesNotMatch(status, /Claude/);
 });
 
 test("status renders cached quota immediately and refreshes expired accounts in the background", {
@@ -8354,5 +8379,215 @@ test("the Codex slot is published with a token-shaped placeholder that carries n
 	} finally {
 		await t.fire("session_shutdown");
 		rmSync(MODELS, { force: true });
+	}
+});
+
+test("status preserves Antigravity subscription and quotas across mid-session OAuth token rotation and sibling-process updates", {
+	concurrency: false,
+}, async () => {
+	const now = Date.now();
+	const originalFetch = globalThis.fetch;
+	const authHeaders: string[] = [];
+	globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+		const url = String(input);
+		const authHeader = (init?.headers as Record<string, string> | undefined)?.Authorization;
+		if (authHeader) authHeaders.push(authHeader);
+		await wait(40);
+		if (url.includes("loadCodeAssist")) {
+			return Response.json({ paidTier: { name: "Google AI Ultra" } });
+		}
+		if (url.includes("retrieveUserQuotaSummary")) {
+			return Response.json({
+				groups: [
+					{
+						displayName: "Gemini",
+						buckets: [
+							{ window: "5h", remainingFraction: 0.85, resetTime: new Date(now + 18_000_000).toISOString() },
+							{ window: "weekly", remainingFraction: 0.95, resetTime: new Date(now + 604_800_000).toISOString() },
+						],
+					},
+				],
+			});
+		}
+		return Response.json({});
+	}) as typeof fetch;
+
+	const hash = (token: string) =>
+		createHash("sha256").update(token).digest("hex").slice(0, 12);
+	const t = setup({
+		accounts: {
+			"antigravity-account-3": {
+				type: "oauth",
+				access: "ag-token-old",
+				refresh: "ag-refresh",
+				projectId: "aicode-consumers",
+				email: "eryx@example.com",
+			},
+		},
+		current: { provider: "antigravity-account-3", id: "gemini-3.8-flash" },
+		config: { autoDiscover: true, showUsage: false, fallbacks: ["antigravity-account-3"] },
+		statusFetch: globalThis.fetch,
+		seedState: {
+			stateVersion: 5,
+			usageByProvider: {
+				"antigravity-account-3": {
+					provider: "antigravity-account-3",
+					family: "antigravity",
+					fetchedAt: now - 60_000,
+					credentialHash: hash("ag-token-old"),
+					account: "eryx@example.com",
+					plan: "Google AI Ultra",
+					serviceable: true,
+					primary: { usedPercent: 10, resetAt: now + 18_000_000, windowSeconds: 18_000 },
+					modelQuotas: {
+						Gemini: {
+							primary: { usedPercent: 10, resetAt: now + 18_000_000, windowSeconds: 18_000 },
+							secondary: { usedPercent: 3, resetAt: now + 604_800_000, windowSeconds: 604_800 },
+						},
+					},
+				},
+			},
+		},
+	});
+
+	try {
+		// 1. Mid-session 55-minute Google OAuth token rotation on the same account.
+		await wait(5);
+		writeFileSync(
+			AUTH,
+			JSON.stringify({
+				"antigravity-account-3": {
+					type: "oauth",
+					access: "ag-token-rotated",
+					refresh: "ag-refresh",
+					projectId: "aicode-consumers",
+					email: "eryx@example.com",
+				},
+			}),
+		);
+
+		await t.command("", "status");
+		const immediate = t.rec.notifies.at(-1) ?? "";
+		assert.doesNotMatch(immediate, /订阅未知|尚未加载/, `status must not blank on OAuth token rotation: ${immediate}`);
+		assert.match(immediate, /eryx@example\.com: Google AI Ultra\s+当前/);
+		assert.match(immediate, /Gemini 5h 90% \/ 7d 97%/);
+
+		// Wait for the background refresh triggered by the rotated credentialHash.
+		await wait(180);
+		assert.ok(authHeaders.includes("Bearer ag-token-rotated"), "rotated token must still trigger a background refresh");
+		await t.command("", "status");
+		assert.match(t.rec.notifies.at(-1) ?? "", /Gemini 5h 85% \/ 7d 95%/);
+
+		// 2. Re-login into a DIFFERENT Google account drops the previous user's plan/quotas,
+		//    while still surfacing the new email from auth.json instead of bare "Antigravity".
+		await wait(5);
+		writeFileSync(
+			AUTH,
+			JSON.stringify({
+				"antigravity-account-3": {
+					type: "oauth",
+					access: "ag-token-other-user",
+					refresh: "ag-refresh-other",
+					projectId: "aicode-consumers",
+					email: "other@example.com",
+				},
+			}),
+		);
+		await t.command("", "status");
+		const relogged = t.rec.notifies.at(-1) ?? "";
+		assert.doesNotMatch(relogged, /Google AI Ultra|eryx@example\.com/);
+		assert.match(relogged, /other@example\.com: 订阅未知\s+当前/);
+
+		// 3. Sibling Pi process writes a fresher snapshot for the new account to disk; status picks it up.
+		const stateOnDisk = t.readState();
+		writeFileSync(
+			STATE,
+			JSON.stringify({
+				...stateOnDisk,
+				usageByProvider: {
+					"antigravity-account-3": {
+						provider: "antigravity-account-3",
+						family: "antigravity",
+						fetchedAt: Date.now() + 1_000,
+						credentialHash: hash("ag-token-other-user"),
+						account: "other@example.com",
+						plan: "Google AI Pro",
+						serviceable: true,
+						primary: { usedPercent: 0, resetAt: now + 18_000_000, windowSeconds: 18_000 },
+					},
+				},
+			}),
+		);
+		await t.command("", "status");
+		const fromSibling = t.rec.notifies.at(-1) ?? "";
+		assert.match(fromSibling, /other@example\.com: Google AI Pro\s+当前/);
+		assert.doesNotMatch(fromSibling, /尚未加载/);
+	} finally {
+		globalThis.fetch = originalFetch;
+		await t.fire("session_shutdown");
+	}
+});
+
+test("session_start does not block interactive startup on slow remote quota and catalog endpoints", {
+	concurrency: false,
+}, async () => {
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = (async (input: string | URL | Request) => {
+		const url = String(input);
+		await wait(350);
+		if (url.includes("wham/usage")) {
+			return Response.json({
+				email: "slow@example.com",
+				plan_type: "pro",
+				rate_limit: {
+					allowed: true,
+					limit_reached: false,
+					primary_window: { used_percent: 12, reset_at: Math.floor((Date.now() + 18_000_000) / 1000) },
+				},
+			});
+		}
+		if (url.includes("/models")) {
+			return Response.json({
+				models: [{ slug: "gpt-5.6-sol", display_name: "5.6 Sol", visibility: "list", priority: 10, supported_reasoning_levels: [{ effort: "high" }] }],
+			});
+		}
+		return Response.json({});
+	}) as typeof fetch;
+
+	const t = setup({
+		accounts: {
+			"openai-codex-account-2": {
+				type: "oauth",
+				access: "c-slow",
+				refresh: "r-slow",
+				accountId: "acct-slow",
+			},
+		},
+		current: { provider: "openai-codex-account-2", id: "gpt-5.5" },
+		config: { showUsage: true, autoDiscoverModels: true },
+		statusFetch: globalThis.fetch,
+	});
+
+	try {
+		const startedAt = Date.now();
+		await t.fire("session_start", { reason: "startup" });
+		const startupMs = Date.now() - startedAt;
+		assert.ok(
+			startupMs < 260,
+			`session_start must not wait for 350ms+ remote endpoints; took ${startupMs}ms`,
+		);
+
+		// Background completion still finishes and persists the fresh usage & catalog.
+		await wait(450);
+		const state = t.readState();
+		assert.equal(state.usageByProvider?.["openai-codex-account-2"]?.plan, "pro");
+		assert.ok(
+			state.codexModelCatalogByProvider?.["openai-codex-account-2"]?.models?.some(
+				(m: any) => m.id === "gpt-5.6-sol",
+			),
+		);
+	} finally {
+		await t.fire("session_shutdown");
+		globalThis.fetch = originalFetch;
 	}
 });

@@ -60,8 +60,9 @@ export function endpointCandidates(): string[] {
   return explicit ? [assertSafeApiBaseUrl(explicit)] : ENDPOINT_FALLBACKS;
 }
 
+// fetchAvailableModels gates new generations by CLI version (1.1.23 hides Gemini 4).
 const DEFAULT_USER_AGENT =
-  "antigravity/cli/1.1.23 (aidev_client; os_type=linux; arch=amd64; cl=974125021; auth_method=consumer)";
+  "antigravity/cli/1.5.3 (aidev_client; os_type=linux; arch=amd64; auth_method=consumer)";
 
 /** Default User-Agent matching pure Antigravity CLI wire fingerprint. */
 export function defaultUserAgent(): string {
@@ -443,7 +444,6 @@ export function mergeAvailableModelsResults(
     const data = result.data;
     if (isRecord(data) && isRecord(data.models)) {
       Object.assign(mergedModels, data.models);
-      registerDiscoveredModelEnums(data.models as Record<string, { model?: unknown }>);
     }
     if (isRecord(data) && typeof data.defaultAgentModelId === "string") {
       defaultAgentModelId = data.defaultAgentModelId;

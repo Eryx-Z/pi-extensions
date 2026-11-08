@@ -322,8 +322,12 @@ export function resetAntigravityCatalogForTests(): void {
 }
 
 /** Resolve public model id + thinking effort to Antigravity runtime model id. */
-export function getAntigravityRequestModelId(modelId: string, effort: string | undefined): string {
-  const r = currentRouting[modelId] ?? ANTIGRAVITY_ROUTING[modelId];
+export function getAntigravityRequestModelId(
+  modelId: string,
+  effort: string | undefined,
+  routing: Record<string, AntigravityRouting> = currentRouting,
+): string {
+  const r = routing[modelId];
   if (!r) return modelId;
 
   if (effort === undefined || effort === "off") {

@@ -12,6 +12,7 @@ const XAI_FAST_APIS = new Set(["openai-responses", "openai-completions"]);
 export interface XaiFastModel {
 	provider?: unknown;
 	api?: unknown;
+	id?: unknown;
 }
 
 /** Built-in xAI subscription and numbered slots. Other APIs are left untouched. */

@@ -1,13 +1,14 @@
 import { lazyStream, type Model, type SimpleStreamOptions } from '@earendil-works/pi-ai';
-import { streamSimpleOpenAIResponses } from '@earendil-works/pi-ai/compat';
 import type { ExtensionAPI, ProviderConfig } from '@earendil-works/pi-coding-agent';
-import * as oauth from './auth/oauth.js';
+import { getBaseUrl } from './auth/config.js';
 import { resolveModels } from './models/catalog.js';
-import { sanitizePayload } from './payload/sanitize.js';
 import { ACCOUNT_VAULT_MARKER } from './provider/accountVault.js';
-import { resolveGrokRoute } from './provider/route.js';
-import { streamWithProxyRetry } from './provider/proxyRetry.js';
 import { grokCliModelHeaders, grokCliVersionHeaders, resolveGrokCliVersion, refreshGrokCliVersion } from './provider/stream.js';
+
+let grokOauthPromise: Promise<typeof import('./auth/oauth.js')> | undefined;
+const loadGrokOauth = () => (grokOauthPromise ??= import('./auth/oauth.js'));
+let grokSanitizePromise: Promise<typeof import('./payload/sanitize.js')> | undefined;
+const loadGrokSanitize = () => (grokSanitizePromise ??= import('./payload/sanitize.js'));
 
 /** Shared parent/child provider core. No tools, model restore, account rotation or UI hooks. */
 export function registerGrokProvider(pi: ExtensionAPI, child = false) {
@@ -20,19 +21,21 @@ export function registerGrokProvider(pi: ExtensionAPI, child = false) {
       if (child) throw new Error('Log in to Grok from the parent session: /login grok-cli');
       if (process.env.GROK_CLI_OAUTH_TOKEN) throw new Error('Unset GROK_CLI_OAUTH_TOKEN before logging in to Grok.');
       // New logins use Pi's normal credential store. Existing vault markers remain supported.
+      const oauth = await loadGrokOauth();
       return oauth.login(callbacks);
     },
-    refreshToken(credentials) {
+    async refreshToken(credentials) {
       if (credentials.access === ACCOUNT_VAULT_MARKER && credentials.refresh === ACCOUNT_VAULT_MARKER) {
-        return Promise.resolve({ ...credentials, expires: Number.MAX_SAFE_INTEGER });
+        return { ...credentials, expires: Number.MAX_SAFE_INTEGER };
       }
+      const oauth = await loadGrokOauth();
       return oauth.refresh(credentials);
     },
     getApiKey: credentials => credentials.access,
   };
   pi.registerProvider('grok-cli', {
     name: 'Grok (multi-account)',
-    baseUrl: oauth.getBaseUrl(),
+    baseUrl: getBaseUrl(),
     api: 'openai-responses',
     oauth: authentication,
     ...(process.env.GROK_CLI_OAUTH_TOKEN ? { apiKey: '$GROK_CLI_OAUTH_TOKEN' } : {}),
@@ -40,6 +43,11 @@ export function registerGrokProvider(pi: ExtensionAPI, child = false) {
     streamSimple(model, context, options?: SimpleStreamOptions) {
       const sessionId = options?.sessionId;
       return lazyStream(model, async () => {
+        const [{ resolveGrokRoute }, { streamWithProxyRetry }, { streamSimpleOpenAIResponses }] = await Promise.all([
+          import('./provider/route.js'),
+          import('./provider/proxyRetry.js'),
+          import('@earendil-works/pi-ai/compat'),
+        ]);
         const [route, resolvedVersion] = await Promise.all([
           resolveGrokRoute(options?.apiKey), resolveGrokCliVersion(),
         ]);
@@ -69,8 +77,9 @@ export function registerGrokProvider(pi: ExtensionAPI, child = false) {
   pi.on('before_provider_headers', (event, ctx) => {
     if (ctx.model?.provider === 'grok-cli') event.headers['x-grok-conv-id'] = convId(ctx.sessionManager.getSessionId());
   });
-  pi.on('before_provider_request', (event, ctx) => {
+  pi.on('before_provider_request', async (event, ctx) => {
     if (ctx.model?.provider !== 'grok-cli' || !event.payload || typeof event.payload !== 'object') return;
+    const { sanitizePayload } = await loadGrokSanitize();
     return sanitizePayload(event.payload as Record<string, unknown>, ctx.model.id, ctx.sessionManager.getSessionId(), ctx.cwd);
   });
 }
