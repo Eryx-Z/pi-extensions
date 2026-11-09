@@ -13,7 +13,6 @@
       "./packages/pi-multi-account/index.ts",
       "./packages/pi-open-terminal/index.ts",
       "./packages/pi-skill-manager/index.ts",
-      "./packages/pi-status-hub/src/index.ts",
       "./packages/pi-token-usage/src/index.ts"
     ]
   },
