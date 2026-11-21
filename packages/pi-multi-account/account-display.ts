@@ -23,8 +23,6 @@ export function familyDisplayLabel(family: ProviderFamily): string {
 	switch (family) {
 		case "openai-codex":
 			return "ChatGPT";
-		case "antigravity":
-			return "Antigravity";
 		case "anthropic":
 			return "Claude";
 		case "kimi-coding":
@@ -50,11 +48,7 @@ export function slotAccountDetails(
 	let rawAccount: string | undefined;
 	let rawPlan: string | undefined = usagePlan;
 
-	if (family === "antigravity") {
-		if (typeof entry.email === "string" && entry.email.trim()) {
-			rawAccount = entry.email.trim();
-		}
-	} else if (family === "openai-codex") {
+	if (family === "openai-codex") {
 		if (typeof entry.access === "string" && entry.access) {
 			const payload = decodeJwtPayload(entry.access);
 			rawAccount =

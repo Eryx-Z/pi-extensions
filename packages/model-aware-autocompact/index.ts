@@ -13,6 +13,7 @@ import {
 import {
 	createOverheadTracker,
 	decideGuard,
+	effectiveWindow,
 	estimateRawTokens,
 	estimateMessageTokens,
 	type GuardMessage,
@@ -22,8 +23,34 @@ import { createSummaryGuard } from "./output-summaries.ts";
 
 const STATUS_KEY = "model-aware-autocompact";
 
+export const AUTOCOMPACT_RETRY_DELAY_MS = 2_000;
+
+const TRANSIENT_COMPACT_ERROR_RE =
+	/\b(?:408|425|429|500|502|503|504|529)\b|rate[_\s-]?limit|too many requests|overloaded|service unavailable|temporarily unavailable|internal server error|bad gateway|gateway timeout|request timeout|timed out|timeout|connection reset|econnreset|econnrefused|enetunreach|enotfound|eai_again|fetch failed|network error|socket hang up|stream disconnected|server error/i;
+
+export function isTransientCompactError(error: unknown): boolean {
+	const msg =
+		error instanceof Error
+			? error.message
+			: typeof error === "string"
+				? error
+				: String(error ?? "");
+	return TRANSIENT_COMPACT_ERROR_RE.test(msg);
+}
+
+function resolveAutocompactRetryDelayMs(): number {
+	const override = Number(process.env.PI_AUTOCOMPACT_RETRY_MS);
+	return Number.isFinite(override) && override >= 0
+		? override
+		: AUTOCOMPACT_RETRY_DELAY_MS;
+}
+
 function modelKey(model: { provider: string; id: string }): string {
 	return `${model.provider}/${model.id}`;
+}
+
+function providerSlotGroup(provider: string): string {
+	return provider.replace(/-account-\d+$/, "");
 }
 
 export default function (pi: ExtensionAPI) {
@@ -39,18 +66,34 @@ export default function (pi: ExtensionAPI) {
 		return config.models[modelKey(model)] ?? config.percent;
 	}
 
+	function usableContextWindow(declaredWindow: number): number {
+		return config.contextGuard.enabled
+			? effectiveWindow(declaredWindow, config.contextGuard)
+			: declaredWindow;
+	}
+
 	function thresholdFor(contextWindow: number, percent: number): number {
-		return Math.floor(contextWindow * (percent / 100));
+		return Math.floor(usableContextWindow(contextWindow) * (percent / 100));
 	}
 
 	// Keep our own lock through the callback, not just session_compact (which fires
 	// before Pi clears its controller). External compactions have their own lock.
 	let compacting: object | undefined;
+	let compactRetryTimer: ReturnType<typeof setTimeout> | undefined;
+
+	function clearCompactRetryTimer(): void {
+		if (!compactRetryTimer) return;
+		clearTimeout(compactRetryTimer);
+		compactRetryTimer = undefined;
+	}
 	let externalCompacting = false;
 	let agentRunning = false;
 	const trackers = new Map<string, OverheadTracker>();
-	const summaryGuard = createSummaryGuard();
+	const summaryGuard = createSummaryGuard(90_000, { maxBatchesPerApply: 4 });
 	let projectionEpoch = 0;
+	let activeProjectionModel:
+		| { provider: string; id: string; usableWindow: number }
+		| undefined;
 	let lastRequest: {
 		model: string;
 		raw: number;
@@ -65,7 +108,9 @@ export default function (pi: ExtensionAPI) {
 	const warned = new Set<string>();
 
 	function trackerFor(ctx: ExtensionContext): OverheadTracker {
-		const key = ctx.model ? modelKey(ctx.model) : "?/?";
+		const key = ctx.model
+			? `${providerSlotGroup(ctx.model.provider)}/${ctx.model.id}`
+			: "?/?";
 		let tracker = trackers.get(key);
 		if (!tracker) {
 			tracker = createOverheadTracker();
@@ -77,6 +122,14 @@ export default function (pi: ExtensionAPI) {
 	function resetProjection(): void {
 		projectionEpoch++;
 		summaryGuard.reset();
+		activeProjectionModel = undefined;
+		lastRequest = undefined;
+	}
+
+	function resetProjectionKeepSummaries(): void {
+		projectionEpoch++;
+		summaryGuard.clearActiveElisions();
+		activeProjectionModel = undefined;
 		lastRequest = undefined;
 	}
 
@@ -146,6 +199,7 @@ export default function (pi: ExtensionAPI) {
 			);
 		}
 		const percent = percentFor(ctx.model);
+		const usableWindow = usableContextWindow(usage.contextWindow);
 		const threshold = thresholdFor(usage.contextWindow, percent);
 		if (tokens < threshold) return;
 
@@ -153,31 +207,63 @@ export default function (pi: ExtensionAPI) {
 		compacting = owner;
 		if (ctx.hasUI) {
 			ctx.ui.notify(
-				`上下文已达 ${((tokens / usage.contextWindow) * 100).toFixed(1)}%，开始自动 compact（阈值 ${percent}% / ${threshold.toLocaleString()} tokens）`,
+				`上下文已达 ${((tokens / usableWindow) * 100).toFixed(1)}%，开始自动 compact（阈值 ${percent}% / ${threshold.toLocaleString()} tokens）`,
 				"info",
 			);
 		}
 
-		try {
-			ctx.compact({
-				customInstructions: `Triggered automatically at ${percent}% context usage.`,
-				onComplete: () => {
-					if (compacting !== owner) return;
-					compacting = undefined;
-					resetProjection();
-					if (ctx.hasUI) ctx.ui.notify("自动 compact 完成", "info");
-				},
-				onError: (error) => {
-					if (compacting !== owner) return;
-					compacting = undefined;
-					if (ctx.hasUI)
-						ctx.ui.notify(`自动 compact 失败：${error.message}`, "error");
-				},
-			});
-		} catch (error) {
-			if (compacting === owner) compacting = undefined;
-			throw error;
-		}
+		const startCompactAttempt = (attempt: 0 | 1): void => {
+			try {
+				ctx.compact({
+					customInstructions: `Triggered automatically at ${percent}% context usage.`,
+					onComplete: () => {
+						if (compacting !== owner) return;
+						clearCompactRetryTimer();
+						compacting = undefined;
+						resetProjection();
+						if (ctx.hasUI) ctx.ui.notify("自动 compact 完成", "info");
+					},
+					onError: (error: Error) => {
+						if (compacting !== owner) return;
+						clearCompactRetryTimer();
+						if (attempt === 0 && isTransientCompactError(error)) {
+							if (ctx.hasUI) {
+								ctx.ui.notify(
+									`自动 compact 遇到瞬时错误（${error.message}），2s 后重试 1 次…`,
+									"warning",
+								);
+							}
+							const delayMs = resolveAutocompactRetryDelayMs();
+							compactRetryTimer = setTimeout(() => {
+								compactRetryTimer = undefined;
+								if (compacting !== owner) return;
+								if (
+									externalCompacting ||
+									agentRunning ||
+									!ctx.isIdle() ||
+									ctx.hasPendingMessages()
+								) {
+									compacting = undefined;
+									return;
+								}
+								startCompactAttempt(1);
+							}, delayMs);
+							(compactRetryTimer as { unref?: () => void }).unref?.();
+							return;
+						}
+						compacting = undefined;
+						if (ctx.hasUI)
+							ctx.ui.notify(`自动 compact 失败：${error.message}`, "error");
+					},
+				});
+			} catch (error) {
+				clearCompactRetryTimer();
+				if (compacting === owner) compacting = undefined;
+				throw error;
+			}
+		};
+
+		startCompactAttempt(0);
 	}
 
 	function parsePercent(value: string): number | undefined {
@@ -186,6 +272,7 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	pi.on("session_start", (_event, ctx) => {
+		clearCompactRetryTimer();
 		compacting = undefined;
 		externalCompacting = false;
 		agentRunning = false;
@@ -212,8 +299,16 @@ export default function (pi: ExtensionAPI) {
 			}
 		}
 	});
-	pi.on("session_tree", () => resetProjection());
-	pi.on("session_shutdown", () => resetProjection());
+	pi.on("session_tree", () => {
+		clearCompactRetryTimer();
+		compacting = undefined;
+		resetProjection();
+	});
+	pi.on("session_shutdown", () => {
+		clearCompactRetryTimer();
+		compacting = undefined;
+		resetProjection();
+	});
 
 	pi.on("context", async (event, ctx) => {
 		if (!config.contextGuard.enabled || compacting || externalCompacting) return;
@@ -244,6 +339,15 @@ export default function (pi: ExtensionAPI) {
 		lastRequest = request;
 		if (decision.window <= 0) return;
 		windowSeen = true;
+		if (ctx.model) {
+			activeProjectionModel = {
+				provider: ctx.model.provider,
+				id: ctx.model.id,
+				usableWindow: decision.window,
+			};
+		}
+		// O(1) fast path on normal turns below softPercent when no prior elisions exist.
+		if (!decision.trim && !summaryGuard.hasActiveElisions()) return;
 		const epoch = projectionEpoch;
 		const plan = await summaryGuard.apply(
 			messages,
@@ -336,7 +440,32 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("model_select", (event, ctx) => {
-		resetProjection();
+		const nextWindow = usableContextWindow(event.model.contextWindow);
+		const sameFamilyProjection =
+			!!activeProjectionModel &&
+			providerSlotGroup(activeProjectionModel.provider) ===
+				providerSlotGroup(event.model.provider) &&
+			activeProjectionModel.id === event.model.id &&
+			activeProjectionModel.usableWindow === nextWindow;
+		if (sameFamilyProjection) {
+			activeProjectionModel = {
+				provider: event.model.provider,
+				id: event.model.id,
+				usableWindow: nextWindow,
+			};
+			if (lastRequest && lastRequest.model !== modelKey(event.model)) {
+				lastRequest = { ...lastRequest, model: modelKey(event.model) };
+			}
+		} else {
+			resetProjectionKeepSummaries();
+			if (nextWindow > 0) {
+				activeProjectionModel = {
+					provider: event.model.provider,
+					id: event.model.id,
+					usableWindow: nextWindow,
+				};
+			}
+		}
 		updateStatus(ctx);
 		const percent = percentFor(event.model);
 		const threshold = thresholdFor(event.model.contextWindow, percent);
@@ -346,7 +475,7 @@ export default function (pi: ExtensionAPI) {
 					? "默认"
 					: "模型专用";
 			ctx.ui.notify(
-				`已应用${scope}阈值 ${percent}%：${threshold.toLocaleString()} / ${event.model.contextWindow.toLocaleString()} tokens`,
+				`已应用${scope}阈值 ${percent}%：${threshold.toLocaleString()} / ${nextWindow.toLocaleString()} tokens`,
 				"info",
 			);
 		}

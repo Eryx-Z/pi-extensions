@@ -52,12 +52,17 @@ function contentChars(content: unknown): number {
   return chars;
 }
 
+const messageTokenCache = new WeakMap<GuardMessage, number>();
+const summaryKeyCache = new WeakMap<GuardMessage, string | null>();
+
 /**
  * Token estimate for one message, mirroring Pi's `estimateTokens` so the two agree on what a
  * conversation "costs". Unknown roles contribute 0, exactly as Pi does.
  */
 export function estimateMessageTokens(message: GuardMessage): number {
-  if (!message || typeof message.role !== "string") return 0;
+  if (!message || typeof message !== "object" || typeof message.role !== "string") return 0;
+  const cached = messageTokenCache.get(message);
+  if (cached !== undefined) return cached;
   let chars = 0;
   switch (message.role) {
     case "user":
@@ -86,9 +91,12 @@ export function estimateMessageTokens(message: GuardMessage): number {
       chars = typeof message.summary === "string" ? message.summary.length : 0;
       break;
     default:
+      messageTokenCache.set(message, 0);
       return 0;
   }
-  return Math.ceil(chars / 4);
+  const tokens = Math.ceil(chars / 4);
+  messageTokenCache.set(message, tokens);
+  return tokens;
 }
 
 /**
@@ -268,9 +276,18 @@ export function summarySource(message: GuardMessage): string | undefined {
 
 /** Source fingerprint includes metadata as well as the payload, never just a reused call id. */
 export function summaryKey(message: GuardMessage): string | undefined {
+  if (!message || typeof message !== "object") return undefined;
+  if (summaryKeyCache.has(message)) {
+    return summaryKeyCache.get(message) ?? undefined;
+  }
   const identity = elisionKey(message);
-  if (!identity || summarySource(message) === undefined) return undefined;
-  return identity + ":" + createHash("sha256").update(JSON.stringify(message)).digest("hex");
+  if (!identity || summarySource(message) === undefined) {
+    summaryKeyCache.set(message, null);
+    return undefined;
+  }
+  const computed = identity + ":" + createHash("sha256").update(JSON.stringify(message)).digest("hex");
+  summaryKeyCache.set(message, computed);
+  return computed;
 }
 
 export interface SummaryCandidate {

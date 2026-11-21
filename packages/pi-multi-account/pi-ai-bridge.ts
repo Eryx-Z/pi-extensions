@@ -3,7 +3,8 @@
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
-import { existsSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
+import { homedir } from "node:os";
 import * as hostPiAi from "@earendil-works/pi-ai";
 
 // ---------------------------------------------------------------------------
@@ -53,6 +54,11 @@ type PiAiOauthBridge = {
 		refresh: (credentials: any, signal: AbortSignal) => Promise<any>;
 		getApiKey: (credentials: any) => string;
 	};
+	xai?: {
+		login: (callbacks: any) => Promise<any>;
+		refresh: (credentials: any, signal: AbortSignal) => Promise<any>;
+		getApiKey: (credentials: any) => string;
+	};
 };
 
 let piAiOauthBridge: PiAiOauthBridge | undefined;
@@ -90,10 +96,38 @@ export function piAiRootCandidates(
 			// Not resolvable from here — the ancestor paths above may still hit.
 		}
 	}
+	if (typeof process.argv[1] === "string" && process.argv[1]) {
+		let entryDir = dirname(process.argv[1]);
+		try {
+			entryDir = dirname(realpathSync(process.argv[1]));
+		} catch {
+			// Keep the raw argv[1] directory if it is a virtual or unresolvable path.
+		}
+		for (let depth = 0; depth < 12; depth++) {
+			candidates.push(
+				join(entryDir, "node_modules", "@earendil-works", "pi-coding-agent", "node_modules", "@earendil-works", "pi-ai"),
+				join(entryDir, "node_modules", "@earendil-works", "pi-ai"),
+			);
+			const parent = dirname(entryDir);
+			if (parent === entryDir) break;
+			entryDir = parent;
+		}
+	}
+	const globalRoots = [
+		process.env.PI_GLOBAL_NODE_MODULES,
+		join(homedir(), ".npm-global", "lib", "node_modules"),
+		join(dirname(process.execPath), "..", "lib", "node_modules"),
+	].filter((root): root is string => Boolean(root));
+	for (const root of globalRoots) {
+		candidates.push(
+			join(root, "@earendil-works", "pi-coding-agent", "node_modules", "@earendil-works", "pi-ai"),
+			join(root, "@earendil-works", "pi-ai"),
+		);
+	}
 	return [...new Set(candidates)];
 }
 
-function findPiAiRoot(): string | undefined {
+export function findPiAiRoot(): string | undefined {
 	if (piAiPackageRoot !== undefined) return piAiPackageRoot ?? undefined;
 	const here = fileURLToPath(import.meta.url);
 	const localRequire = createRequire(import.meta.url);
@@ -198,6 +232,7 @@ function adaptLazyProviderFactories(
 	const anthropicRel = join("providers", "anthropic.js");
 	const codexRel = join("providers", "openai-codex.js");
 	const kimiRel = join("providers", "kimi-coding.js");
+	const xaiRel = join("providers", "xai.js");
 	if (
 		!existsSync(join(root, "dist", anthropicRel)) ||
 		!existsSync(join(root, "dist", codexRel))
@@ -207,6 +242,7 @@ function adaptLazyProviderFactories(
 	let anthropicOauth: any;
 	let codexOauth: any;
 	let kimiOauth: any;
+	let xaiOauth: any;
 	const requireFlow = (rel: string, fnName: string, label: string) => {
 		const oauth = load(rel)?.[fnName]?.()?.auth?.oauth;
 		if (
@@ -226,6 +262,9 @@ function adaptLazyProviderFactories(
 	const hasKimi = existsSync(join(root, "dist", kimiRel));
 	const getKimi = () =>
 		(kimiOauth ??= requireFlow(kimiRel, "kimiCodingProvider", "Kimi"));
+	const hasXai = existsSync(join(root, "dist", xaiRel));
+	const getXai = () =>
+		(xaiOauth ??= requireFlow(xaiRel, "xaiProvider", "xAI"));
 
 	return {
 		era: "provider-factories",
@@ -247,6 +286,13 @@ function adaptLazyProviderFactories(
 			? {
 					login: (callbacks) => getKimi().login(toAuthInteraction(callbacks)),
 					refresh: (credentials, signal) => getKimi().refresh(credentials, signal),
+					getApiKey: (credentials) => credentials.access,
+				}
+			: undefined,
+		xai: hasXai
+			? {
+					login: (callbacks) => getXai().login(toAuthInteraction(callbacks)),
+					refresh: (credentials, signal) => getXai().refresh(credentials, signal),
 					getApiKey: (credentials) => credentials.access,
 				}
 			: undefined,

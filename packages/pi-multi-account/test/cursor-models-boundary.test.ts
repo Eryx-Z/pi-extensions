@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import { stripTypeScriptTypes } from "node:module";
 import test from "node:test";
-import ts from "typescript";
 // Cursor's vendored entry points are intentionally excluded by the package tsconfig.
 // Load their actual runtime surface without pulling the whole proxy/proto tree into tsc.
 const models = await import(new URL("../cursor/models.ts", import.meta.url).href);
@@ -121,12 +121,20 @@ function runtimeModuleGraph(entry: URL): Set<string> {
     visited.add(url.href);
     if (url.pathname.endsWith(".json")) continue;
     const source = readFileSync(url, "utf8");
-    const { outputText } = ts.transpileModule(source, {
-      fileName: url.pathname,
-      compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext },
-    });
-    for (const dependency of ts.preProcessFile(outputText, true, true).importedFiles) {
-      if (dependency.fileName.startsWith(".")) pending.push(new URL(dependency.fileName, url));
+    const outputText = url.pathname.endsWith(".ts")
+      ? stripTypeScriptTypes(source, { mode: "transform" } as unknown as Parameters<typeof stripTypeScriptTypes>[1])
+      : source;
+    const uncommented = outputText.replace(/\/\*[\s\S]*?\*\/|(^|[^:])\/\/.*$/gm, "$1");
+    const pattern = /(?:\b(?:import|export)\s+(?:[^"']*?\s+from\s+)?|\bimport\s*\(\s*)["'](\.[^"']+)["']/g;
+    for (const match of uncommented.matchAll(pattern)) {
+      const spec = match[1];
+      if (!spec) continue;
+      const candidate = new URL(spec, url);
+      if (spec.endsWith(".js") && !spec.endsWith(".mjs")) {
+        const tsCandidate = new URL(`${spec.slice(0, -3)}.ts`, url);
+        try { readFileSync(tsCandidate); pending.push(tsCandidate); continue; } catch {}
+      }
+      pending.push(candidate);
     }
   }
   return visited;

@@ -1,6 +1,7 @@
-import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 
 /** xAI Priority Processing. Same wire value as Codex fast mode, separate preference. */
 export const XAI_FAST_SERVICE_TIER = "priority";
@@ -27,30 +28,54 @@ export function xaiFastPreferencePath(
 	return join(agentDir, XAI_FAST_PREFERENCE_NAME);
 }
 
+const xaiFastCache = new Map<string, { stamp: string; enabled: boolean }>();
+
 /** Missing or unreadable preference means off, so priority billing is opt-in. */
 export function readXaiFastEnabled(path = xaiFastPreferencePath()): boolean {
+	const key = resolve(path);
 	try {
-		const parsed = JSON.parse(readFileSync(path, "utf8"));
-		if (
-			parsed &&
-			typeof parsed === "object" &&
-			!Array.isArray(parsed) &&
-			typeof (parsed as { enabled?: unknown }).enabled === "boolean"
-		) {
-			return (parsed as { enabled: boolean }).enabled;
+		const st = statSync(key);
+		const stamp = `${st.ino}:${st.size}:${st.mtimeMs}:${st.ctimeMs}`;
+		const cached = xaiFastCache.get(key);
+		if (cached && cached.stamp === stamp) return cached.enabled;
+		let enabled = false;
+		try {
+			const parsed = JSON.parse(readFileSync(key, "utf8"));
+			if (
+				parsed &&
+				typeof parsed === "object" &&
+				!Array.isArray(parsed) &&
+				typeof (parsed as { enabled?: unknown }).enabled === "boolean"
+			) {
+				enabled = (parsed as { enabled: boolean }).enabled;
+			}
+		} catch {
+			enabled = false;
 		}
+		xaiFastCache.set(key, { stamp, enabled });
+		return enabled;
 	} catch {
-		// ENOENT and corrupt files both fall through to the default.
+		xaiFastCache.set(key, { stamp: "ENOENT", enabled: false });
+		return false;
 	}
-	return false;
 }
 
 export function writeXaiFastEnabled(enabled: boolean, path = xaiFastPreferencePath()): void {
-	mkdirSync(dirname(path), { recursive: true });
-	const temporary = `${path}.${process.pid}.${Date.now()}.tmp`;
+	const key = resolve(path);
+	mkdirSync(dirname(key), { recursive: true });
+	const temporary = `${key}.${process.pid}.${randomUUID()}.tmp`;
 	try {
 		writeFileSync(temporary, `${JSON.stringify({ enabled })}\n`, { mode: 0o600 });
-		renameSync(temporary, path);
+		renameSync(temporary, key);
+		try {
+			const st = statSync(key);
+			xaiFastCache.set(key, {
+				stamp: `${st.ino}:${st.size}:${st.mtimeMs}:${st.ctimeMs}`,
+				enabled,
+			});
+		} catch {
+			xaiFastCache.delete(key);
+		}
 	} finally {
 		rmSync(temporary, { force: true });
 	}

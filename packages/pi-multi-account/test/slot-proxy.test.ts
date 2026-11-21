@@ -15,10 +15,19 @@ import {
 	isPublishedPlaceholder,
 	placeholderKeyFor,
 	presentedCredential,
+	SLOT_PROXY_HEALTH_PATH,
+	isHealthySlotProxyProbe,
+	probeHealthySlotProxy,
 	publishedRouteFor,
 	shapeUpstreamRequest,
+	shapeProxyCodexBody,
+	buildPlaceholderJwt,
 	type ProxyRoute,
 } from "../slot-proxy.ts";
+import { createServer } from "node:http";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 const ROUTES = new Map<string, ProxyRoute>([
 	["anthropic-account-2", { slotId: "anthropic-account-2", family: "anthropic" }],
@@ -63,11 +72,12 @@ test("a path trying to climb out of its slot is refused, not normalised", () => 
 // Admission — the two gates
 // ---------------------------------------------------------------------------
 
-test("a published slot presenting the placeholder is admitted", () => {
+test("a published slot presenting the placeholder is admitted when no secret file exists", () => {
 	const verdict = admitRequest({
 		rawUrl: "/anthropic-account-2/v1/messages",
 		headers: withKey(),
 		routes: ROUTES,
+		secretPath: "/nonexistent/slot-proxy-key",
 	});
 	assert.equal(verdict.ok, true);
 	if (!verdict.ok) return;
@@ -271,23 +281,80 @@ test("Pi reads an account id out of the Codex key, so that placeholder is token-
 });
 
 test("each family is published with the placeholder its own API will accept", () => {
-	assert.equal(placeholderKeyFor("codex"), PROXY_PLACEHOLDER_JWT);
-	assert.equal(placeholderKeyFor("anthropic"), PROXY_PLACEHOLDER_KEY);
+	const missingSecret = "/nonexistent/slot-proxy-key";
+	assert.equal(placeholderKeyFor("codex", missingSecret), PROXY_PLACEHOLDER_JWT);
+	assert.equal(placeholderKeyFor("anthropic", missingSecret), PROXY_PLACEHOLDER_KEY);
 });
 
 test("both placeholders are admitted; nothing else is", () => {
-	assert.equal(isPublishedPlaceholder(PROXY_PLACEHOLDER_KEY), true);
-	assert.equal(isPublishedPlaceholder(PROXY_PLACEHOLDER_JWT), true);
+	const missingSecret = "/nonexistent/slot-proxy-key";
+	assert.equal(isPublishedPlaceholder(PROXY_PLACEHOLDER_KEY, missingSecret), true);
+	assert.equal(isPublishedPlaceholder(PROXY_PLACEHOLDER_JWT, missingSecret), true);
 	for (const other of [undefined, "", "sk-real", `${PROXY_PLACEHOLDER_JWT}x`]) {
-		assert.equal(isPublishedPlaceholder(other), false, String(other));
+		assert.equal(isPublishedPlaceholder(other, missingSecret), false, String(other));
 	}
 });
 
-test("a Codex slot presenting the JWT placeholder is admitted", () => {
+test("slot-proxy-key derives per-user alg:none JWT and strictly rejects public legacy constants", () => {
+	const dir = mkdtempSync(join(tmpdir(), "slot-proxy-secret-"));
+	try {
+		const secretPath = join(dir, "slot-proxy-key");
+		writeFileSync(secretPath, "my-local-machine-secret-99\n", { mode: 0o600 });
+		const codexJwt = placeholderKeyFor("codex", secretPath);
+		const anthropicKey = placeholderKeyFor("anthropic", secretPath);
+		assert.notEqual(codexJwt, PROXY_PLACEHOLDER_JWT);
+		assert.notEqual(anthropicKey, PROXY_PLACEHOLDER_KEY);
+		assert.equal(codexJwt.includes("my-local-machine-secret-99"), false);
+		assert.equal(codexJwt, buildPlaceholderJwt(anthropicKey));
+		const header = JSON.parse(Buffer.from(codexJwt.split(".")[0]!, "base64").toString("utf8"));
+		assert.equal(header.alg, "none");
+
+		// Derived per-user tokens are admitted.
+		for (const token of [codexJwt, anthropicKey]) {
+			const verdict = admitRequest({
+				rawUrl: "/openai-codex-account-4/codex/responses",
+				headers: { authorization: `Bearer ${token}` },
+				routes: ROUTES,
+				secretPath,
+			});
+			assert.equal(verdict.ok, true);
+		}
+		// Public legacy constants and forged tokens are strictly rejected when slot-proxy-key exists.
+		for (const rejectedToken of [
+			PROXY_PLACEHOLDER_JWT,
+			PROXY_PLACEHOLDER_KEY,
+			buildPlaceholderJwt("forged-other-user"),
+		]) {
+			const rejected = admitRequest({
+				rawUrl: "/openai-codex-account-4/codex/responses",
+				headers: { authorization: `Bearer ${rejectedToken}` },
+				routes: ROUTES,
+				secretPath,
+			});
+			assert.equal(rejected.ok, false);
+			if (!rejected.ok) assert.equal(rejected.status, 401);
+		}
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("shapeProxyCodexBody injects or removes service_tier priority per codex-fast-mode", () => {
+	const raw = Buffer.from(JSON.stringify({ model: "gpt-6-astra", input: "hello" }));
+	const withFast = JSON.parse(shapeProxyCodexBody(raw, true).toString("utf8"));
+	assert.equal(withFast.service_tier, "priority");
+	const withoutFast = JSON.parse(
+		shapeProxyCodexBody(Buffer.from(JSON.stringify(withFast)), false).toString("utf8"),
+	);
+	assert.equal("service_tier" in withoutFast, false);
+});
+
+test("a Codex slot presenting the JWT placeholder is admitted when no secret file exists", () => {
 	const verdict = admitRequest({
 		rawUrl: "/openai-codex-account-4/codex/responses",
 		headers: { authorization: `Bearer ${PROXY_PLACEHOLDER_JWT}` },
 		routes: ROUTES,
+		secretPath: "/nonexistent/slot-proxy-key",
 	});
 	assert.equal(verdict.ok, true);
 });
@@ -316,4 +383,29 @@ test("a Codex credential with no account id sends none, rather than the placehol
 	assert.equal(shaped.ok, true);
 	if (!shaped.ok) return;
 	assert.equal(shaped.headers["chatgpt-account-id"], undefined);
+});
+
+test("healthy loopback slot-proxy probe requires explicit 200 health JSON and rejects all 404 responses", async () => {
+	assert.equal(isHealthySlotProxyProbe(200, JSON.stringify({ ok: true, service: "pi-multi-account-slot-proxy" })), true);
+	assert.equal(isHealthySlotProxyProbe(404, JSON.stringify({ error: { message: "not a slot route" } })), false);
+	assert.equal(isHealthySlotProxyProbe(404, "Not Found"), false);
+	assert.equal(isHealthySlotProxyProbe(200, JSON.stringify({ ok: true, service: "something-else" })), false);
+
+	const server = createServer((req, res) => {
+		if (req.url === SLOT_PROXY_HEALTH_PATH) {
+			res.writeHead(200, { "content-type": "application/json" });
+			res.end(JSON.stringify({ ok: true, service: "pi-multi-account-slot-proxy" }));
+			return;
+		}
+		res.writeHead(500);
+		res.end();
+	});
+	await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+	try {
+		const addr = server.address();
+		const port = typeof addr === "object" && addr ? addr.port : 0;
+		assert.equal(await probeHealthySlotProxy(port), true);
+	} finally {
+		server.close();
+	}
 });

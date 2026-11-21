@@ -3,8 +3,10 @@ import {
 	existsSync,
 	mkdirSync,
 	mkdtempSync,
+	readdirSync,
 	readFileSync,
 	rmSync,
+	statSync,
 	writeFileSync,
 } from "node:fs";
 import { createRequire } from "node:module";
@@ -212,6 +214,10 @@ test("legacy fallback reads only contextGuard; saving migrates without changing 
 	assert.equal(config.contextGuard.enabled, true);
 	assert.equal(config.contextGuard.softPercent, 0.9);
 	saveConfig(dir, config);
+	if (process.platform !== "win32") {
+		assert.equal(statSync(join(dir, "model-aware-autocompact.json")).mode & 0o777, 0o600);
+	}
+	assert.deepEqual(readdirSync(dir).filter((f) => f.endsWith(".tmp")), []);
 	assert.deepEqual(
 		JSON.parse(readFileSync(join(dir, "model-aware-autocompact.json"), "utf8")),
 		config,
@@ -740,4 +746,133 @@ test("late old-session completion cannot unlock a new-session compact", async (t
 	old.onComplete();
 	await h.emit("agent_settled");
 	assert.equal(h.compactions.length, 2);
+});
+
+test("transient 429/5xx/network auto-compact error retries once after backoff and stops after second failure", async (t) => {
+	const prevRetryMs = process.env.PI_AUTOCOMPACT_RETRY_MS;
+	process.env.PI_AUTOCOMPACT_RETRY_MS = "30";
+	t.after(() => {
+		if (prevRetryMs === undefined) delete process.env.PI_AUTOCOMPACT_RETRY_MS;
+		else process.env.PI_AUTOCOMPACT_RETRY_MS = prevRetryMs;
+	});
+
+	// Case A: 429 rate limit fails first attempt, succeeds on single retry
+	const h1 = await harness(t);
+	h1.setUsage(95_000);
+	await h1.emit("agent_settled");
+	assert.equal(h1.compactions.length, 1);
+	h1.compactions[0].onError(new Error("HTTP 429 rate_limit_exceeded"));
+	assert.equal(h1.compactions.length, 1, "must wait backoff before retrying");
+	await new Promise((r) => setTimeout(r, 60));
+	assert.equal(h1.compactions.length, 2, "must retry once after backoff");
+	h1.compactions[1].onComplete();
+	assert.ok(h1.notifications.some((n) => n.text.includes("自动 compact 完成")));
+
+	// Case B: 503 fails twice -> stops after 1 retry and reports final error
+	const h2 = await harness(t);
+	h2.setUsage(95_000);
+	await h2.emit("agent_settled");
+	assert.equal(h2.compactions.length, 1);
+	h2.compactions[0].onError(new Error("503 Service Unavailable"));
+	await new Promise((r) => setTimeout(r, 60));
+	assert.equal(h2.compactions.length, 2);
+	h2.compactions[1].onError(new Error("ECONNRESET socket hang up"));
+	await new Promise((r) => setTimeout(r, 60));
+	assert.equal(h2.compactions.length, 2, "must not retry more than once");
+	assert.ok(
+		h2.notifications.some((n) => n.type === "error" && n.text.includes("ECONNRESET")),
+	);
+});
+
+test("saveConfig preserves top-level $schema across command updates and direct saves", async (t) => {
+	const schemaUrl = "./schemas/model-aware-autocompact.schema.json";
+	const h = await harness(t, {
+		$schema: schemaUrl,
+		percent: 50,
+		models: {},
+		contextGuard: { enabled: true },
+	});
+	await h.command("60");
+	const raw = JSON.parse(
+		readFileSync(join(h.dir, "model-aware-autocompact.json"), "utf8"),
+	);
+	assert.equal(raw.$schema, schemaUrl);
+	assert.equal(Object.keys(raw)[0], "$schema");
+	assert.equal(raw.percent, 60);
+
+	// Direct saveConfig without $schema in memory still preserves disk $schema
+	saveConfig(h.dir, {
+		percent: 45,
+		models: { "openai-codex/gpt-6-astra": 55 },
+		contextGuard: DEFAULT_CONTEXT_GUARD_SETTINGS,
+	});
+	const rawAfterDirect = JSON.parse(
+		readFileSync(join(h.dir, "model-aware-autocompact.json"), "utf8"),
+	);
+	assert.equal(rawAfterDirect.$schema, schemaUrl);
+	assert.equal(rawAfterDirect.percent, 45);
+});
+
+test("HWM batch elision reaches targetTokens in one wave, preserves elisions across same-family slot switches, aligns maxWindowTokens on 1M models, and short-circuits normal turns", async (t) => {
+	// 1. 1M-window model aligns autocompact threshold with contextGuard.maxWindowTokens (400k) instead of 1M
+	const h1m = await harness(t, {
+		percent: 50,
+		models: {},
+		contextGuard: {
+			enabled: true,
+			softPercent: 0.75,
+			targetPercent: 0.6,
+			keepVerbatimTokens: 40_000,
+			minElideTokens: 500,
+			maxWindowTokens: 400_000,
+		},
+	});
+	h1m.ctx.model = { provider: "openai-codex", id: "gpt-6-astra", contextWindow: 1_000_000 };
+	await h1m.emit("model_select", { model: h1m.ctx.model, source: "restore" });
+	h1m.setUsage(199_999, 1_000_000);
+	await h1m.emit("agent_settled");
+	assert.equal(h1m.compactions.length, 0, "below 50% of 400k usable window");
+	h1m.setUsage(200_000, 1_000_000);
+	await h1m.emit("agent_settled");
+	assert.equal(h1m.compactions.length, 1, "50% of 400k usable window (200k) triggers before 75% guard (300k)");
+
+	// 2. Normal turn below softPercent short-circuits in O(1) without calling complete()
+	const h = await harness(t, {
+		contextGuard: {
+			enabled: true,
+			softPercent: 0.75,
+			targetPercent: 0.5,
+			keepVerbatimTokens: 10_000,
+			minElideTokens: 500,
+			maxWindowTokens: 100_000,
+		},
+	});
+	const small = [{ role: "user", content: "hello" }];
+	assert.equal(await h.emit("context", { messages: small }), undefined);
+	assert.equal(h.summaryCalls.length, 0);
+
+	// 3. HWM batch elision summarizes >4 items in one context pass when needed, then keeps prefix stable across same-family slot switch
+	const twenty = Array.from({ length: 20 }, (_, i) => ({
+		role: "toolResult",
+		toolCallId: `hwm-${i}`,
+		toolName: "read",
+		isError: false,
+		content: [{ type: "text", text: "y".repeat(14_000) }],
+	}));
+	await h.emit("agent_start");
+	const firstPass = await h.emit("context", { messages: twenty });
+	assert.ok(firstPass);
+	const summarizedInWave1 = firstPass.messages.filter((m: any) =>
+		text(m).startsWith(SUMMARY_MARKER),
+	).length;
+	assert.ok(summarizedInWave1 > 4, `expected >4 items summarized in single HWM wave, got ${summarizedInWave1}`);
+	const callsAfterWave1 = h.summaryCalls.length;
+
+	// Switch to numbered sibling slot of same family & model -> must NOT wipe elided prefix or re-summarize!
+	h.ctx.model = { provider: "test-account-2", id: "large", contextWindow: 100_000 };
+	await h.emit("model_select", { model: h.ctx.model, source: "api" });
+	const afterSlotSwitch = await h.emit("context", { messages: twenty });
+	assert.ok(afterSlotSwitch, "same-family slot switch must preserve active elided prefix");
+	assert.deepEqual(afterSlotSwitch.messages, firstPass.messages, "prefix stays byte-identical across sibling account slots");
+	assert.equal(h.summaryCalls.length, callsAfterWave1, "zero extra summary LLM calls after slot rotation");
 });

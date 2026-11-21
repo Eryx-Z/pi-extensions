@@ -279,7 +279,6 @@ export const DEFAULT_PROVIDER_ORDER: ProviderFamily[] = [
 	"anthropic",
 	"openai-codex",
 	"kimi-coding",
-	"antigravity",
 	"cursor",
 	"qwen",
 	"ollama",
@@ -371,7 +370,6 @@ export function normalizeConfig(raw: ProviderFailoverConfig): RuntimeConfig {
 				f === "anthropic" ||
 				f === "openai-codex" ||
 				f === "kimi-coding" ||
-				f === "antigravity" ||
 				f === "cursor" ||
 				f === "qwen" ||
 				f === "ollama",

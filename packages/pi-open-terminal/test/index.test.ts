@@ -6,7 +6,11 @@ import { afterEach, mock, test } from "node:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import register from "../index.ts";
 
+const savedTerminal = process.env.TERMINAL;
+
 afterEach(() => {
+  if (savedTerminal === undefined) delete process.env.TERMINAL;
+  else process.env.TERMINAL = savedTerminal;
   mock.restoreAll();
   syncBuiltinESMExports();
 });
@@ -38,6 +42,7 @@ function stubSpawn() {
 }
 
 test("opens Kitty in the session directory and detaches only after spawn", async () => {
+  delete process.env.TERMINAL;
   const { child, spawn } = stubSpawn();
   const { run, notifications } = setup();
   await run();
@@ -49,16 +54,35 @@ test("opens Kitty in the session directory and detaches only after spawn", async
   assert.deepEqual(notifications, []);
   child.emit("spawn");
   assert.equal(child.unref.mock.callCount(), 1);
+  assert.equal(child.listenerCount("spawn"), 0);
+  assert.equal(child.listenerCount("error"), 0);
   assert.deepEqual(notifications, [["已打开终端：/tmp/a directory", "info"]]);
 });
 
-test("reports a missing terminal without throwing", async () => {
+test("reports a missing terminal without throwing and cleans up listeners", async () => {
+  delete process.env.TERMINAL;
   const { child } = stubSpawn();
   const { run, notifications } = setup();
   await run();
   child.emit("error", new Error("ENOENT"));
   assert.deepEqual(notifications, [["无法打开 Kitty：ENOENT", "error"]]);
   assert.equal(child.unref.mock.callCount(), 0);
+  assert.equal(child.listenerCount("spawn"), 0);
+  assert.equal(child.listenerCount("error"), 0);
+});
+
+test("respects $TERMINAL with arguments while inheriting cwd", async () => {
+  process.env.TERMINAL = "alacritty --option window.opacity=0.95";
+  const { child, spawn } = stubSpawn();
+  const { run, notifications } = setup();
+  await run();
+  assert.deepEqual(spawn.mock.calls[0].arguments, [
+    "alacritty",
+    ["--option", "window.opacity=0.95"],
+    { cwd: "/tmp/a directory", detached: true, stdio: "ignore" },
+  ]);
+  child.emit("error", new Error("ENOENT"));
+  assert.deepEqual(notifications, [["无法打开 alacritty：ENOENT", "error"]]);
 });
 
 test("does not spawn outside TUI and warns only if a UI is available", async () => {

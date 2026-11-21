@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, beforeEach, test } from "node:test";
@@ -8,12 +8,14 @@ const agentDir = mkdtempSync(join(tmpdir(), "pmacct-storage-"));
 const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
 process.env.PI_CODING_AGENT_DIR = agentDir;
 const { loadConfig, normalizeConfig } = await import("../failover-config.ts");
-const { loadState, saveState, STATE_VERSION } = await import("../failover-state.ts");
+const { loadState, saveState, maskEmailAccount, redactSensitiveText, STATE_VERSION } = await import("../failover-state.ts");
+const { slotsAsAChildSeesThem, isHostBuiltinProvider } = await import("../pi-files.ts");
 const configPath = join(agentDir, "provider-failover.json");
 const statePath = join(agentDir, "provider-failover-state.json");
+const authPath = join(agentDir, "auth.json");
 
 beforeEach(() => {
-  for (const path of [configPath, statePath, statePath + ".tmp"]) {
+  for (const path of [configPath, statePath, statePath + ".tmp", authPath]) {
     rmSync(path, { recursive: true, force: true });
   }
 });
@@ -160,22 +162,149 @@ test("older state keeps plausible quota estimates and model preferences, not sta
   assert.deepEqual(readState(), expected);
 });
 
-test("state saves are private atomic replacements and current-version reads preserve unknown fields", () => {
-  saveState({ lastUserModel: { provider: "openai-codex", id: "model" } });
-  const expected = { stateVersion: STATE_VERSION, lastUserModel: { provider: "openai-codex", id: "model" } };
+test("state saves are private atomic replacements and strip undeclared legacy keys, zombie slots, and plaintext email PII", () => {
+  writeFileSync(authPath, JSON.stringify({
+    "openai-codex": { type: "oauth", access: "a", refresh: "r" },
+    "cursor-account-2": { type: "oauth", access: "a2", refresh: "r2", email: "user.name@domain.com" },
+  }));
+  saveState({
+    lastUserModel: { provider: "openai-codex", id: "model" },
+    exhaustedUntilByProvider: { "openai-codex": 999999, "openai-codex-account-3": 888888 },
+    codexModelCatalogByProvider: {
+      "openai-codex": { fetchedAt: 1, models: [] },
+      "openai-codex-account-3": { fetchedAt: 1, models: [] },
+    },
+    usageByProvider: {
+      "cursor-account-2": {
+        provider: "cursor-account-2",
+        family: "cursor",
+        fetchedAt: 10,
+        account: "user.name@domain.com",
+      },
+      "openai-codex-account-3": {
+        provider: "openai-codex-account-3",
+        family: "codex",
+        fetchedAt: 10,
+        account: "ghost@domain.com",
+      },
+    },
+  });
+  const expected = {
+    stateVersion: STATE_VERSION,
+    exhaustedUntilByProvider: { "openai-codex": 999999 },
+    usageByProvider: {
+      "cursor-account-2": {
+        provider: "cursor-account-2",
+        family: "cursor",
+        fetchedAt: 10,
+        account: "u***@domain.com",
+      },
+    },
+    codexModelCatalogByProvider: {
+      "openai-codex": { fetchedAt: 1, models: [] },
+    },
+    lastUserModel: { provider: "openai-codex", id: "model" },
+  };
   assert.deepEqual(readState(), expected);
   assertPrivateFile(statePath);
   assert.equal(existsSync(statePath + ".tmp"), false);
-  const withFutureField = { ...expected, futureMetadata: { keep: true }, lastProbeAtByProvider: { legacy: 1 } };
-  writeFileSync(statePath, JSON.stringify(withFutureField));
-  assert.deepEqual(loadState(), withFutureField);
-  assert.deepEqual(readState(), withFutureField);
+  assert.equal(maskEmailAccount("u***@domain.com"), "u***@domain.com", "masking is idempotent");
+  assert.equal(maskEmailAccount("acct_12345"), "acct_12345", "non-email identifiers stay intact");
+  const dirtyOnDisk = {
+    ...expected,
+    lastProbeAtByProvider: { "openai-codex": 123 },
+    usageByProvider: {
+      "cursor-account-2": {
+        provider: "cursor-account-2",
+        family: "cursor",
+        fetchedAt: 10,
+        account: "user.name@domain.com",
+      },
+      "openai-codex-account-3": {
+        provider: "openai-codex-account-3",
+        family: "codex",
+        fetchedAt: 10,
+        account: "ghost@domain.com",
+      },
+    },
+  };
+  writeFileSync(statePath, JSON.stringify(dirtyOnDisk));
+  assert.deepEqual(loadState(), expected);
+  assert.deepEqual(readState(), expected);
+  assert.equal(Object.hasOwn(readState(), "lastProbeAtByProvider"), false);
 });
 
 test("a failed state write never throws or destroys the previous complete state", () => {
   saveState({ lastUserThinkingLevel: "high" });
   const before = readFileSync(statePath, "utf8");
-  mkdirSync(statePath + ".tmp"); // Block the temporary write, independently of user/root permissions.
-  assert.doesNotThrow(() => saveState({ lastUserThinkingLevel: "low" }));
+  writeFileSync(authPath, JSON.stringify({ "openai-codex": { type: "oauth", access: "a", refresh: "r" } }));
+  const cyclic: Record<string, unknown> = { provider: "openai-codex", family: "codex", fetchedAt: 1 };
+  cyclic.self = cyclic;
+  assert.doesNotThrow(() => saveState({ lastUserThinkingLevel: "low", usageByProvider: { "openai-codex": cyclic as any } }));
   assert.equal(readFileSync(statePath, "utf8"), before);
+  if (process.platform !== "win32" && process.getuid?.() !== 0) {
+    chmodSync(agentDir, 0o500);
+    try {
+      assert.doesNotThrow(() => saveState({ lastUserThinkingLevel: "low" }));
+      assert.equal(readFileSync(statePath, "utf8"), before);
+    } finally {
+      chmodSync(agentDir, 0o700);
+    }
+  }
+  assert.deepEqual(readdirSync(agentDir).filter((f) => f.endsWith(".tmp")), []);
+});
+
+test("sanitizeState strips disabled families from lastModelByFamily and redacts tokens/emails in reasons", () => {
+  writeFileSync(configPath, JSON.stringify({ includeCursor: false, includeQwen: false, includeOllama: true }));
+  writeFileSync(authPath, JSON.stringify({
+    "openai-codex": { type: "oauth", access: "a", refresh: "r" },
+    anthropic: { type: "oauth", access: "a2", refresh: "r2" },
+  }));
+  saveState({
+    lastModelByFamily: {
+      "openai-codex": "gpt-6.1-sol",
+      cursor: "claude-4-sonnet",
+      qwen: "qwen3.8-max",
+      ollama: "glm-5.2:cloud",
+    },
+    pendingReason: "401 for spike.zhang.ai@gmail.com with Bearer sk-secret1234567890",
+    invalidatedByProvider: {
+      anthropic: {
+        tokenHash: "abc",
+        at: 100,
+        reason: "revoked for alice@example.com key sk-1234567890abcdef",
+      },
+    },
+    lastSwitches: [
+      {
+        from: "anthropic/claude-opus-5",
+        to: "openai-codex/gpt-6.1-sol",
+        reason: "quota hit on bob.smith@corp.io token eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9",
+        at: 200,
+      },
+    ],
+  });
+  const disk = readState();
+  assert.deepEqual(disk.lastModelByFamily, {
+    "openai-codex": "gpt-6.1-sol",
+    ollama: "glm-5.2:cloud",
+  });
+  assert.equal(disk.pendingReason, "401 for s***@gmail.com with «redacted»");
+  assert.equal(disk.invalidatedByProvider.anthropic.reason, "revoked for a***@example.com key «redacted»");
+  assert.equal(disk.lastSwitches[0].reason, "quota hit on b***@corp.io token «redacted»");
+  assert.equal(redactSensitiveText(disk.pendingReason), disk.pendingReason, "redaction is idempotent");
+});
+
+test("slotsAsAChildSeesThem uses explicit host builtin set instead of misclassifying cursor", () => {
+  assert.equal(isHostBuiltinProvider("openai-codex"), true);
+  assert.equal(isHostBuiltinProvider("anthropic"), true);
+  assert.equal(isHostBuiltinProvider("xai"), true);
+  assert.equal(isHostBuiltinProvider("cursor"), false);
+  const verdicts = slotsAsAChildSeesThem(["openai-codex", "cursor"], {
+    "openai-codex": { type: "oauth" },
+    cursor: { type: "oauth" },
+  });
+  assert.equal(verdicts[0]?.usable, true);
+  if (verdicts[0]?.usable) assert.equal(verdicts[0].via, "builtin");
+  assert.equal(verdicts[1]?.usable, false);
 });

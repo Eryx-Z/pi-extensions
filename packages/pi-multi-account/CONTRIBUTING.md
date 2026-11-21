@@ -34,7 +34,7 @@ CI runs the same checks on every pull request; they must pass before review.
 ## Module boundaries
 
 - `index.ts`: parent-session discovery, failover, commands and lifecycle hooks.
-- `subagent-provider.ts` → `provider-slots.ts`: provider-only Codex/Antigravity RPC startup.
+- `subagent-provider.ts` → `provider-slots.ts`: provider-only Codex RPC startup.
   Neither module may import the parent entry point, Grok, Cursor or command registration.
 - `pi-ai-bridge.ts`: lazy OAuth/catalog compatibility across supported pi-ai versions.
 - `auth-state.ts`: credential persistence, identity and refresh-race recovery.

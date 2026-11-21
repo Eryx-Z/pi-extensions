@@ -23,12 +23,29 @@ can be made for a result, return an empty string for that key. Do not combine re
 
 export type SummaryGuardResult = ElisionResult & { summaryError?: string };
 
+function stripJsonFence(raw: string): string {
+  const trimmed = raw.trim();
+  const match = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+  return match ? match[1].trim() : trimmed;
+}
+
+export interface SummaryGuardOptions {
+  /** Maximum 4-item sub-batches per single apply() call when HWM batching is enabled (default 1). */
+  maxBatchesPerApply?: number;
+}
+
 /** The optional deadline is only a test seam, not a user setting. Factory starts no timers. */
-export function createSummaryGuard(timeoutMs = 30_000): {
+export function createSummaryGuard(
+  timeoutMs = 90_000,
+  options: SummaryGuardOptions = {},
+): {
   apply(messages: GuardMessage[], settings: ElisionSettings, ctx: ExtensionContext, compressModel?: string): Promise<SummaryGuardResult>;
   reset(): void;
+  clearActiveElisions(): void;
+  hasActiveElisions(): boolean;
   beginRun(): void;
 } {
+  const maxBatchesPerApply = Math.max(1, Math.floor(options.maxBatchesPerApply ?? 1));
   const summaries = new Map<string, string>();
   const elidedKeys = new Set<string>();
   const failed = new Set<string>();
@@ -38,6 +55,17 @@ export function createSummaryGuard(timeoutMs = 30_000): {
 
   return {
     beginRun() {
+      generationFailed = false;
+      failed.clear();
+    },
+    hasActiveElisions() {
+      return elidedKeys.size > 0;
+    },
+    clearActiveElisions() {
+      epoch++;
+      pending?.abort(new Error("Summary projection cleared"));
+      pending = undefined;
+      elidedKeys.clear();
       generationFailed = false;
       failed.clear();
     },
@@ -53,8 +81,18 @@ export function createSummaryGuard(timeoutMs = 30_000): {
     async apply(messages, settings, ctx, compressModel) {
       const currentEpoch = epoch;
       const parentSignal = ctx.signal;
+      if (!parentSignal?.aborted && elidedKeys.size === 0 && !Number.isFinite(settings.targetTokens)) {
+        return {
+          messages,
+          changed: false,
+          elidedNow: 0,
+          elidedTotal: 0,
+          freedTokens: 0,
+          tokensAfter: 0,
+        };
+      }
       // Preview without committing applied-key accounting until this apply finishes.
-      const preview = planElision(messages, new Set(elidedKeys), settings, summaries);
+      let preview = planElision(messages, new Set(elidedKeys), settings, summaries);
       const finish = (summaryError?: string): SummaryGuardResult => {
         // Even a provider ignoring abort cannot publish output into a replaced session/branch.
         const result = currentEpoch === epoch && !parentSignal?.aborted
@@ -88,104 +126,118 @@ export function createSummaryGuard(timeoutMs = 30_000): {
       // A chars budget of one contextWindow is roughly a quarter of the model's input window.
       // Reserve room for instruction/JSON overhead and up to 4 x 512 output tokens as well.
       const sourceBudget = Math.min(64_000, Math.floor(Math.max(0, model.contextWindow - 4096)));
-      const batch: ReturnType<typeof summaryCandidates> = [];
-      const results: Record<string, unknown>[] = [];
-      let sourceChars = 0;
-      let projectedTokens = preview.tokensAfter;
-      for (const candidate of summaryCandidates(messages, settings)) {
-        if (summaries.has(candidate.key) || failed.has(candidate.key) || candidate.tokens < settings.minElideTokens) continue;
-        const message = candidate.message;
-        const data = {
-          key: candidate.key,
-          role: message.role,
-          toolName: message.toolName,
-          command: message.command,
-          isError: message.isError,
-          exitCode: message.exitCode,
-          truncated: message.truncated,
-          source: candidate.source,
-        };
-        const chars = JSON.stringify(data).length;
-        // Never silently truncate a source to make it fit. Oversize results remain raw.
-        if (sourceChars + chars > sourceBudget) continue;
-        batch.push(candidate);
-        results.push(data);
-        sourceChars += chars;
-        projectedTokens -= Math.max(0, candidate.tokens - Math.ceil(MAX_SUMMARY_CHARS / 4));
-        if (batch.length === 4 || projectedTokens <= settings.targetTokens) break;
-      }
-      if (!batch.length) return finish();
-      // Failures (including invalid individual summaries) are retried only on a new agent run.
-      for (const candidate of batch) failed.add(candidate.key);
-      const controller = new AbortController();
-      pending = controller;
-      const parentAbort = () => controller.abort(new Error("Summary generation aborted"));
-      parentSignal?.addEventListener("abort", parentAbort, { once: true });
-      if (parentSignal?.aborted) parentAbort();
-      let abortListener: (() => void) | undefined;
-      const aborted = new Promise<never>((_, reject) => {
-        abortListener = () => reject(controller.signal.reason ?? new Error("Summary generation aborted"));
-        controller.signal.addEventListener("abort", abortListener, { once: true });
-        if (controller.signal.aborted) abortListener();
-      });
-      // Race the deadline as well as sending signal: custom providers may ignore cancellation.
-      const timer = setTimeout(() => controller.abort(new Error("Summary generation timed out")), timeoutMs);
-      try {
-        const context: Context = {
-          systemPrompt: SUMMARY_PROMPT,
-          messages: [{ role: "user", content: JSON.stringify({ results }), timestamp: Date.now() }],
-        };
-        const response = await Promise.race([
-          Promise.resolve().then(() => {
-            if (controller.signal.aborted) throw controller.signal.reason;
-            return ctx.modelRegistry.complete(model, context, {
-              signal: controller.signal,
-              maxTokens: model.maxTokens > 0
-                ? Math.min(model.maxTokens, batch.length * 512 + 256)
-                : batch.length * 512 + 256,
-              cacheRetention: "none",
-              // Cursor/checkpoint and Codex conversation state must never share the live session.
-              sessionId: randomUUID(),
-            });
-          }),
-          aborted,
-        ]);
-        if (controller.signal.aborted) throw controller.signal.reason;
-        if (currentEpoch !== epoch) return finish();
-        if (response.stopReason !== "stop") throw new Error(`Summary generation ended with ${response.stopReason}`);
-        const text = response.content.filter((block) => block.type === "text").map((block) => block.text).join("");
-        const parsed: unknown = JSON.parse(text);
-        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("Invalid summary JSON object");
-        const entries = parsed as Record<string, unknown>;
-        const expected = new Set(batch.map((candidate) => candidate.key));
-        if (Object.keys(entries).some((key) => !expected.has(key))) throw new Error("Summary response contains unknown result keys");
-        let invalid = 0;
-        for (const candidate of batch) {
-          const summary = Object.hasOwn(entries, candidate.key) ? entries[candidate.key] : undefined;
-          if (!validSummary(candidate.source, summary)) {
-            invalid++;
-            continue;
+      const allCandidates = summaryCandidates(messages, settings);
+      let firstSummaryError: string | undefined;
+
+      for (let wave = 0; wave < maxBatchesPerApply; wave++) {
+        if (parentSignal?.aborted || currentEpoch !== epoch || generationFailed) break;
+        if (wave > 0) {
+          preview = planElision(messages, new Set([...elidedKeys, ...summaries.keys()]), settings, summaries);
+          if (preview.tokensAfter <= settings.targetTokens) break;
+        }
+        const batch: ReturnType<typeof summaryCandidates> = [];
+        const results: Record<string, unknown>[] = [];
+        let sourceChars = 0;
+        let projectedTokens = preview.tokensAfter;
+        for (const candidate of allCandidates) {
+          if (summaries.has(candidate.key) || failed.has(candidate.key) || candidate.tokens < settings.minElideTokens) continue;
+          const message = candidate.message;
+          const data = {
+            key: candidate.key,
+            role: message.role,
+            toolName: message.toolName,
+            command: message.command,
+            isError: message.isError,
+            exitCode: message.exitCode,
+            truncated: message.truncated,
+            source: candidate.source,
+          };
+          const chars = JSON.stringify(data).length;
+          // Never silently truncate a source to make it fit. Oversize results remain raw.
+          if (sourceChars + chars > sourceBudget) continue;
+          batch.push(candidate);
+          results.push(data);
+          sourceChars += chars;
+          projectedTokens -= Math.max(0, candidate.tokens - Math.ceil(MAX_SUMMARY_CHARS / 4));
+          if (batch.length === 4 || projectedTokens <= settings.targetTokens) break;
+        }
+        if (!batch.length) break;
+        // Failures (including invalid individual summaries) are retried only on a new agent run.
+        for (const candidate of batch) failed.add(candidate.key);
+        const controller = new AbortController();
+        pending = controller;
+        const parentAbort = () => controller.abort(new Error("Summary generation aborted"));
+        parentSignal?.addEventListener("abort", parentAbort, { once: true });
+        if (parentSignal?.aborted) parentAbort();
+        let abortListener: (() => void) | undefined;
+        const aborted = new Promise<never>((_, reject) => {
+          abortListener = () => reject(controller.signal.reason ?? new Error("Summary generation aborted"));
+          controller.signal.addEventListener("abort", abortListener, { once: true });
+          if (controller.signal.aborted) abortListener();
+        });
+        // Race the deadline as well as sending signal: custom providers may ignore cancellation.
+        const timer = setTimeout(() => controller.abort(new Error("Summary generation timed out")), timeoutMs);
+        try {
+          const context: Context = {
+            systemPrompt: SUMMARY_PROMPT,
+            messages: [{ role: "user", content: JSON.stringify({ results }), timestamp: Date.now() }],
+          };
+          const response = await Promise.race([
+            Promise.resolve().then(() => {
+              if (controller.signal.aborted) throw controller.signal.reason;
+              return ctx.modelRegistry.complete(model, context, {
+                signal: controller.signal,
+                maxTokens: model.maxTokens > 0
+                  ? Math.min(model.maxTokens, batch.length * 512 + 256)
+                  : batch.length * 512 + 256,
+                cacheRetention: "none",
+                // Cursor/checkpoint and Codex conversation state must never share the live session.
+                sessionId: randomUUID(),
+              });
+            }),
+            aborted,
+          ]);
+          if (controller.signal.aborted) throw controller.signal.reason;
+          if (currentEpoch !== epoch) return finish();
+          if (response.stopReason !== "stop") throw new Error(`Summary generation ended with ${response.stopReason}`);
+          const text = response.content.filter((block) => block.type === "text").map((block) => block.text).join("");
+          const parsed: unknown = JSON.parse(stripJsonFence(text));
+          if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("Invalid summary JSON object");
+          const entries = parsed as Record<string, unknown>;
+          const expected = new Set(batch.map((candidate) => candidate.key));
+          if (Object.keys(entries).some((key) => !expected.has(key))) throw new Error("Summary response contains unknown result keys");
+          let invalid = 0;
+          for (const candidate of batch) {
+            const summary = Object.hasOwn(entries, candidate.key) ? entries[candidate.key] : undefined;
+            if (!validSummary(candidate.source, summary)) {
+              invalid++;
+              continue;
+            }
+            summaries.set(candidate.key, summary.trim());
+            failed.delete(candidate.key);
           }
-          summaries.set(candidate.key, summary.trim());
-          failed.delete(candidate.key);
+          if (invalid && !firstSummaryError) {
+            firstSummaryError = `Missing or invalid summaries for ${invalid} result(s)`;
+          }
+          if (projectedTokens <= settings.targetTokens) break;
+        } catch (error) {
+          // Caller/session cancellation is not a failure and should not warn or poison a new run.
+          if (currentEpoch !== epoch || parentSignal?.aborted) return finish();
+          // An outage or malformed batch should not add another deadline's latency every turn.
+          generationFailed = true;
+          return finish(error instanceof Error ? error.message : "Summary generation failed");
+        } finally {
+          clearTimeout(timer);
+          parentSignal?.removeEventListener("abort", parentAbort);
+          // User cancellation is not a failed source: a resumed run may retry it immediately.
+          if (parentSignal?.aborted && currentEpoch === epoch) {
+            for (const candidate of batch) failed.delete(candidate.key);
+          }
+          if (abortListener) controller.signal.removeEventListener("abort", abortListener);
+          if (pending === controller) pending = undefined;
         }
-        return finish(invalid ? `Missing or invalid summaries for ${invalid} result(s)` : undefined);
-      } catch (error) {
-        // Caller/session cancellation is not a failure and should not warn or poison a new run.
-        if (currentEpoch !== epoch || parentSignal?.aborted) return finish();
-        // An outage or malformed batch should not add another deadline's latency every turn.
-        generationFailed = true;
-        return finish(error instanceof Error ? error.message : "Summary generation failed");
-      } finally {
-        clearTimeout(timer);
-        parentSignal?.removeEventListener("abort", parentAbort);
-        // User cancellation is not a failed source: a resumed run may retry it immediately.
-        if (parentSignal?.aborted && currentEpoch === epoch) {
-          for (const candidate of batch) failed.delete(candidate.key);
-        }
-        if (abortListener) controller.signal.removeEventListener("abort", abortListener);
-        if (pending === controller) pending = undefined;
       }
+      return finish(firstSummaryError);
     },
   };
 }

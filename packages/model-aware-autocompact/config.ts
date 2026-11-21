@@ -1,11 +1,13 @@
-import { readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { randomUUID } from "node:crypto";
+import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import {
 	DEFAULT_CONTEXT_GUARD_SETTINGS,
 	type ContextGuardSettings,
 } from "./context-guard.ts";
 
 export interface Config {
+	$schema?: string;
 	percent: number;
 	models: Record<string, number>;
 	/** Only tool-output summaries; absent follows the current conversation model. */
@@ -119,7 +121,7 @@ export function adoptLegacyContextGuard(agentDir: string, inherited: ContextGuar
 	const current = value as Record<string, unknown>;
 	if (!Object.hasOwn(current, "contextGuard")) {
 		current.contextGuard = inherited;
-		writeFileSync(path, `${JSON.stringify(current, null, 2)}\n`, "utf8");
+		writeJsonAtomically(path, current);
 	}
 	return normalizeConfig(current, current.contextGuard);
 }
@@ -136,6 +138,9 @@ function normalizeConfig(value: Record<string, unknown>, guard: unknown): Config
 		}
 	}
 	return {
+		...(typeof value.$schema === "string" && value.$schema.trim().length > 0
+			? { $schema: value.$schema.trim() }
+			: {}),
 		percent: isValidPercent(value.percent) ? value.percent : DEFAULT_PERCENT,
 		models,
 		// Keep explicit invalid settings distinct from absence: never silently send
@@ -147,10 +152,33 @@ function normalizeConfig(value: Record<string, unknown>, guard: unknown): Config
 	};
 }
 
+function writeJsonAtomically(path: string, value: unknown): void {
+	mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+	const tmp = `${path}.${process.pid}.${randomUUID()}.tmp`;
+	try {
+		writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`, {
+			encoding: "utf8",
+			mode: 0o600,
+		});
+		renameSync(tmp, path);
+	} finally {
+		try {
+			rmSync(tmp, { force: true });
+		} catch {
+			// Ignore cleanup failures when directory is unwritable.
+		}
+	}
+}
+
 export function saveConfig(agentDir: string, config: Config): void {
-	writeFileSync(
-		join(agentDir, "model-aware-autocompact.json"),
-		`${JSON.stringify(config, null, 2)}\n`,
-		"utf8",
-	);
+	const path = join(agentDir, "model-aware-autocompact.json");
+	const existing = readObject(path);
+	const schema =
+		typeof config.$schema === "string" && config.$schema.trim().length > 0
+			? config.$schema.trim()
+			: typeof existing.$schema === "string" && existing.$schema.trim().length > 0
+				? existing.$schema.trim()
+				: undefined;
+	const { $schema: _ignored, ...rest } = config;
+	writeJsonAtomically(path, schema ? { $schema: schema, ...rest } : rest);
 }

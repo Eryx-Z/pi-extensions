@@ -2,8 +2,8 @@ import assert from "node:assert/strict";
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { stripTypeScriptTypes } from "node:module";
 import test from "node:test";
-import ts from "typescript";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
 
@@ -16,28 +16,20 @@ function localModuleGraph(entry: string): Set<string> {
     if (seen.has(path)) return;
     seen.add(path);
     if (!path.endsWith(".ts")) return;
-    const source = ts.createSourceFile(path, readFileSync(path, "utf8"), ts.ScriptTarget.Latest, true);
-    function follow(specifier: ts.Expression | undefined) {
-      if (!specifier || !ts.isStringLiteralLike(specifier) || !specifier.text.startsWith(".")) return;
-      const target = resolve(dirname(path), specifier.text);
+    const stripped = stripTypeScriptTypes(readFileSync(path, "utf8"), { mode: "transform" } as unknown as Parameters<typeof stripTypeScriptTypes>[1]);
+    const uncommented = stripped.replace(/\/\*[\s\S]*?\*\/|(^|[^:])\/\/.*$/gm, "$1");
+    const pattern = /(?:\b(?:import|export)\s+(?:[^"']*?\s+from\s+)?|\bimport\s*\(\s*)["'](\.[^"']+)["']/g;
+    for (const match of uncommented.matchAll(pattern)) {
+      const spec = match[1];
+      if (!spec) continue;
+      const target = resolve(dirname(path), spec);
       const candidates = target.endsWith(".js")
         ? [target.slice(0, -3) + ".ts", target]
         : [target, target + ".ts", join(target, "index.ts")];
       const resolved = candidates.find((candidate) => existsSync(candidate));
-      assert.ok(resolved, `unresolved local module: ${relative(root, path)} -> ${specifier.text}`);
+      assert.ok(resolved, `unresolved local module: ${relative(root, path)} -> ${spec}`);
       visit(resolved);
     }
-    function walk(node: ts.Node) {
-      if (ts.isImportDeclaration(node)) {
-        if (!node.importClause?.isTypeOnly) follow(node.moduleSpecifier);
-      } else if (ts.isExportDeclaration(node)) {
-        if (!node.isTypeOnly) follow(node.moduleSpecifier);
-      } else if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword) {
-        follow(node.arguments[0]);
-      }
-      ts.forEachChild(node, walk);
-    }
-    walk(source);
   }
   visit(join(root, entry));
   return new Set([...seen].map((path) => relative(root, path).replaceAll("\\", "/")));

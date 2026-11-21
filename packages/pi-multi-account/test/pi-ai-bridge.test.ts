@@ -28,11 +28,12 @@ const EXTENSION_SOURCES = JSON.parse(
 	readFileSync(join(REPO_ROOT, "package.json"), "utf8"),
 ).files as string[];
 
-const { piAiRootCandidates } = (await import("../index.ts")) as {
+const { piAiRootCandidates, findPiAiRoot } = (await import("../index.ts")) as {
 	piAiRootCandidates: (
 		fromFile: string,
 		resolver?: (specifier: string) => string,
 	) => string[];
+	findPiAiRoot: () => string | undefined;
 };
 
 /** pi-ai <= 0.79: real runtime helpers on the `dist/oauth.js` entry point. */
@@ -256,6 +257,11 @@ test("pi-ai is discovered when hoisted next to the package, not nested inside it
 	assert.equal(
 		candidates[0],
 		"/home/u/.pi/agent/npm/node_modules/pi-multi-account/node_modules/@earendil-works/pi-ai",
+	);
+	const hostRoot = findPiAiRoot();
+	assert.ok(
+		hostRoot && readFileSync(join(hostRoot, "package.json"), "utf8").includes("@earendil-works/pi-ai"),
+		`expected findPiAiRoot() to resolve host pi-ai without local node_modules copy, got: ${String(hostRoot)}`,
 	);
 });
 

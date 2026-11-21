@@ -5,7 +5,7 @@
 	"type": "module",
 	"description": "Model-aware automatic context compaction and cached tool-output summaries for Pi",
 	"scripts": {
-		"test": "node --import tsx --test test/*.test.ts",
+		"test": "node --experimental-transform-types --import ../../test/register-pi-peers.mjs --test test/*.test.ts",
 		"typecheck": "tsc -p tsconfig.json"
 	},
 	"keywords": [
@@ -19,6 +19,7 @@
 		"typescript": "^6.0.3"
 	},
 	"peerDependencies": {
+		"@earendil-works/pi-ai": "*",
 		"@earendil-works/pi-coding-agent": "*"
 	},
 	"pi": {

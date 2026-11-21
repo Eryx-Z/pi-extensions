@@ -5,7 +5,6 @@ export type UsageFamily =
 	| "cursor"
 	| "qwen"
 	| "kimi-coding"
-	| "antigravity"
 	| "xai";
 
 export type UsageWindow = {
@@ -48,28 +47,6 @@ export type UsageSnapshot = {
 	};
 	/** Number of provider-granted manual rate-limit resets still available. */
 	rateLimitResetCredits?: number;
-	/**
-	 * Model-specific quota pools for multi-model providers like Antigravity.
-	 * Keyed by model display label (e.g. "Gemini", "Claude").
-	 */
-	modelQuotas?: Record<string, { primary?: UsageWindow; secondary?: UsageWindow }>;
-};
-
-export function preserveKnownPlan(snapshot: UsageSnapshot, previous?: UsageSnapshot): UsageSnapshot {
-	if (!previous || snapshot.family !== "antigravity" || !snapshot.planWarning || snapshot.plan ||
-		snapshot.provider !== previous.provider || !previous.plan || previous.plan === "subscription") {
-		return snapshot;
-	}
-	const hasAccount = typeof snapshot.account === "string" && snapshot.account.trim().length > 0;
-	const sameAccount = hasAccount
-		? snapshot.account === previous.account
-		: Boolean(
-				!previous.account &&
-				snapshot.credentialHash &&
-				snapshot.credentialHash === previous.credentialHash,
-			);
-	if (!sameAccount) return snapshot;
-	return { ...snapshot, plan: previous.plan };
 }
 
 export type UsageCredential = {
@@ -79,7 +56,6 @@ export type UsageCredential = {
 	key?: string;
 	expires?: number;
 	email?: string;
-	projectId?: string;
 };
 
 export class UsageFetchError extends Error {
@@ -159,8 +135,6 @@ export function usageFamily(provider: string): UsageFamily | undefined {
 		return "qwen";
 	if (provider === "kimi-coding" || /^kimi-coding-account-\d+$/.test(provider))
 		return "kimi-coding";
-	if (provider === "antigravity" || /^antigravity-account-\d+$/.test(provider))
-		return "antigravity";
 	if (provider === "xai" || /^xai-account-\d+$/.test(provider))
 		return "xai";
 	return undefined;
@@ -462,265 +436,6 @@ function fetchCursorUsageSnapshot(
 	};
 }
 
-async function fetchAntigravityUsageSnapshot(
-	provider: string,
-	credential: UsageCredential,
-	options: {
-		fetchImpl?: typeof fetch;
-		timeoutMs?: number;
-		credentialHash?: string;
-	} = {},
-): Promise<UsageSnapshot> {
-	if (credential.type !== "oauth" || !credential.access) {
-		throw new UsageFetchError(`${provider} has no OAuth access token`);
-	}
-	const fetchImpl = options.fetchImpl ?? fetch;
-	const timeout = options.timeoutMs ?? 10_000;
-	const headers = {
-		Authorization: `Bearer ${credential.access}`,
-		"Content-Type": "application/json",
-		"User-Agent": "antigravity/hub/2.8.0",
-		"X-Goog-Api-Client": "google-cloud-sdk vscode_cloudshelleditor/0.1",
-		"Client-Metadata": JSON.stringify({
-			ideType: "ANTIGRAVITY",
-			platform: "PLATFORM_UNSPECIFIED",
-			pluginType: "GEMINI",
-		}),
-	};
-
-	let tierName: string | undefined;
-	let projectId: string | undefined = (credential as any).projectId;
-	const email: string | undefined = (credential as any).email;
-	let endpoint = "https://daily-cloudcode-pa.googleapis.com";
-	const candidateEndpoints = [
-		"https://daily-cloudcode-pa.googleapis.com",
-		"https://cloudcode-pa.googleapis.com",
-	];
-
-	// 1. loadCodeAssist for plan tier + project
-	const planFailures: string[] = [];
-	for (const ep of candidateEndpoints) {
-		const controller = new AbortController();
-		const timer = setTimeout(() => controller.abort(), timeout);
-		try {
-			const res = await fetchImpl(
-				`${ep}/v1internal:loadCodeAssist`,
-				{
-					method: "POST",
-					headers,
-					body: JSON.stringify({
-						metadata: {
-							ideType: "ANTIGRAVITY",
-							platform: "PLATFORM_UNSPECIFIED",
-							pluginType: "GEMINI",
-						},
-					}),
-					signal: controller.signal,
-				},
-			);
-			if (res.status === 401) {
-				throw new UsageFetchError("Antigravity loadCodeAssist: HTTP 401", 401);
-			}
-			if (res.ok) {
-				endpoint = ep;
-				const data = (await res.json()) as any;
-				tierName = [data.paidTier?.name, data.paidTier?.id,
-					data.currentTier?.name, data.currentTier?.id]
-					.find((value) => typeof value === "string" && value.trim());
-				if (!projectId && typeof data.cloudaicompanionProject === "string") {
-					projectId = data.cloudaicompanionProject;
-				}
-				if (tierName) break;
-				planFailures.push(`${new URL(ep).hostname}: missing tier`);
-			} else {
-				planFailures.push(`${new URL(ep).hostname}: HTTP ${res.status}`);
-			}
-		} catch (error) {
-			if (error instanceof UsageFetchError && error.status === 401) throw error;
-			// Do not expose response bodies, tokens, or arbitrary transport error messages.
-			planFailures.push(`${new URL(ep).hostname}: ${controller.signal.aborted ? "timeout" : "request/response failed"}`);
-		} finally {
-			clearTimeout(timer);
-		}
-	}
-
-	// 2. retrieveUserQuotaSummary or fetchAvailableModels for quota pools
-	let primary: UsageWindow | undefined;
-	let secondary: UsageWindow | undefined;
-	let serviceable: boolean | undefined;
-
-	let modelQuotas: Record<string, { primary?: UsageWindow; secondary?: UsageWindow }> | undefined;
-
-	let gemini5h: { fraction: number; resetTime?: number } | undefined;
-	let geminiWeekly: { fraction: number; resetTime?: number } | undefined;
-	let claude5h: { fraction: number; resetTime?: number } | undefined;
-	let claudeWeekly: { fraction: number; resetTime?: number } | undefined;
-
-	// 2a. Try retrieveUserQuotaSummary first (returns exact group buckets)
-	try {
-		const controller = new AbortController();
-		const timer = setTimeout(() => controller.abort(), timeout);
-		const res = await fetchImpl(
-			`${endpoint}/v1internal:retrieveUserQuotaSummary`,
-			{
-				method: "POST",
-				headers,
-				body: JSON.stringify(projectId ? { project: projectId } : {}),
-				signal: controller.signal,
-			},
-		);
-		clearTimeout(timer);
-		if (res.ok) {
-			const data = (await res.json()) as any;
-			for (const group of data?.groups || []) {
-				const name = String(group?.displayName || "").toLowerCase();
-				const desc = String(group?.description || "").toLowerCase();
-				const isGemini = name.includes("gemini") || desc.includes("gemini");
-				const isClaude =
-					name.includes("claude") || desc.includes("claude") || name.includes("3p");
-				if (!isGemini && !isClaude) continue;
-
-				let best5h: { fraction: number; resetTime?: number } | undefined;
-				let bestWeekly: { fraction: number; resetTime?: number } | undefined;
-
-				for (const b of group?.buckets || []) {
-					if (typeof b?.remainingFraction !== "number") continue;
-					const fraction = Math.max(0, Math.min(1, b.remainingFraction));
-					const resetTime = b.resetTime ? Date.parse(b.resetTime) : undefined;
-					const is5h =
-						b.window === "5h" || (typeof b.bucketId === "string" && b.bucketId.includes("5h"));
-					const isWeekly =
-						b.window === "weekly" ||
-						(typeof b.bucketId === "string" && b.bucketId.includes("weekly"));
-
-					if (is5h) {
-						if (!best5h || fraction < best5h.fraction) best5h = { fraction, resetTime };
-					} else if (isWeekly) {
-						if (!bestWeekly || fraction < bestWeekly.fraction) bestWeekly = { fraction, resetTime };
-					}
-				}
-
-				if (isGemini) {
-					gemini5h = best5h;
-					geminiWeekly = bestWeekly;
-				} else if (isClaude) {
-					claude5h = best5h;
-					claudeWeekly = bestWeekly;
-				}
-			}
-		}
-	} catch {
-		// retrieveUserQuotaSummary is best-effort
-	}
-
-	// 2b. Fall back to fetchAvailableModels if retrieveUserQuotaSummary yielded nothing
-	if (!gemini5h && !geminiWeekly && !claude5h && !claudeWeekly) {
-		try {
-			const controller = new AbortController();
-			const timer = setTimeout(() => controller.abort(), timeout);
-			const res = await fetchImpl(
-				`${endpoint}/v1internal:fetchAvailableModels`,
-				{
-					method: "POST",
-					headers,
-					body: JSON.stringify(projectId ? { project: projectId } : {}),
-					signal: controller.signal,
-				},
-			);
-			clearTimeout(timer);
-			if (res.ok) {
-				const data = (await res.json()) as any;
-				const models =
-					data?.models && typeof data.models === "object" ? data.models : {};
-
-				// Find quota info for Gemini pool and Claude pool
-				for (const [id, m] of Object.entries<any>(models)) {
-					const qi = m?.quotaInfo;
-					if (!qi || typeof qi.remainingFraction !== "number") continue;
-					const fraction = Math.max(0, Math.min(1, qi.remainingFraction));
-					const resetTime = qi.resetTime ? Date.parse(qi.resetTime) : undefined;
-
-					if (id.startsWith("gemini-") || id.startsWith("gemini_")) {
-						if (!gemini5h || fraction < gemini5h.fraction) {
-							gemini5h = { fraction, resetTime };
-						}
-					} else if (
-						id.startsWith("claude-") ||
-						id.startsWith("claude_") ||
-						id.startsWith("gpt-oss")
-					) {
-						if (!claude5h || fraction < claude5h.fraction) {
-							claude5h = { fraction, resetTime };
-						}
-					}
-				}
-			}
-		} catch {
-			// fetchAvailableModels is best-effort
-		}
-	}
-
-	const buildWindow = (
-		item: { fraction: number; resetTime?: number } | undefined,
-		defaultSeconds: number,
-	): UsageWindow | undefined => {
-		if (!item) return undefined;
-		return {
-			usedPercent: Math.round((1 - item.fraction) * 100),
-			resetAt: item.resetTime ?? Date.now() + defaultSeconds * 1000,
-			windowSeconds: defaultSeconds,
-		};
-	};
-
-	const geminiPrimary = buildWindow(gemini5h, 5 * 3600);
-	const geminiSecondary = buildWindow(geminiWeekly, 7 * 86400);
-	const claudePrimary = buildWindow(claude5h, 5 * 3600);
-	const claudeSecondary = buildWindow(claudeWeekly, 7 * 86400);
-
-	if (geminiPrimary || geminiSecondary || claudePrimary || claudeSecondary) {
-		modelQuotas = {};
-		if (geminiPrimary || geminiSecondary) {
-			modelQuotas["Gemini"] = { primary: geminiPrimary, secondary: geminiSecondary };
-		}
-		if (claudePrimary || claudeSecondary) {
-			modelQuotas["Claude"] = { primary: claudePrimary, secondary: claudeSecondary };
-		}
-	}
-
-	// For legacy consumers expecting primary (Gemini) and secondary (Claude)
-	const pickLegacyWindow = (
-		w5h: UsageWindow | undefined,
-		wWeekly: UsageWindow | undefined,
-	): UsageWindow | undefined => {
-		if (w5h && wWeekly) {
-			return (100 - wWeekly.usedPercent) < (100 - w5h.usedPercent) ? wWeekly : w5h;
-		}
-		return w5h ?? wWeekly;
-	};
-
-	primary = pickLegacyWindow(geminiPrimary, geminiSecondary);
-	secondary = pickLegacyWindow(claudePrimary, claudeSecondary);
-
-	const anyRemaining = [gemini5h, geminiWeekly, claude5h, claudeWeekly].filter(Boolean);
-	if (anyRemaining.length > 0) {
-		serviceable = anyRemaining.some((w) => (w?.fraction ?? 0) > 0);
-	}
-
-	return {
-		provider,
-		family: "antigravity",
-		fetchedAt: Date.now(),
-		credentialHash: options.credentialHash,
-		plan: tierName,
-		planWarning: tierName ? undefined : `Antigravity subscription: ${planFailures.join("; ")}`,
-		account: email,
-		serviceable,
-		primary,
-		secondary,
-		modelQuotas,
-	};
-}
-
 const XAI_BILLING_URL =
 	"https://cli-chat-proxy.grok.com/v1/billing?format=credits";
 const XAI_SETTINGS_URL = "https://cli-chat-proxy.grok.com/v1/settings";
@@ -938,9 +653,6 @@ export async function fetchUsageSnapshot(
 			plan: "subscription · no usage endpoint",
 		};
 	}
-	if (family === "antigravity") {
-		return fetchAntigravityUsageSnapshot(provider, credential, options);
-	}
 	if (family === "qwen") {
 		// Qwen/Alibaba exposes no usage/quota endpoint over its API-key plans, so we
 		// report the plan honestly instead of attempting (and failing) an OAuth usage
@@ -1035,8 +747,6 @@ export function providerUsageLabel(provider: string): string {
 		return index ? `Cursor A${index}` : "Cursor";
 	if (provider.startsWith("kimi-coding"))
 		return index ? `Kimi A${index}` : "Kimi";
-	if (provider.startsWith("antigravity"))
-		return index ? `Antigravity A${index}` : "Antigravity";
 	if (provider.startsWith("alibaba") || /^qwen/i.test(provider))
 		return index ? `Qwen A${index}` : "Qwen/Alibaba";
 	if (provider === "xai" || provider.startsWith("xai-account-"))
@@ -1082,8 +792,6 @@ export function windowLabel(
 ): string {
 	if (family === "cursor") return position === "primary" ? "auth" : "7d";
 	if (family === "ollama") return position === "primary" ? "cloud" : "weekly";
-	if (family === "antigravity")
-		return position === "primary" ? "gemini" : "claude";
 	const seconds = window.windowSeconds;
 	if (!seconds) return position === "primary" ? "5h" : "7d";
 	if (seconds >= 20 * 86_400) return "30d";
@@ -1131,23 +839,28 @@ export function formatUsageCompact(
 	return parts.join(" | ");
 }
 
+function compactFooterProviderLabel(provider: string): string {
+	return providerUsageLabel(provider);
+}
+
 export function formatUsageStatus(
 	snapshot: UsageSnapshot,
 	now = Date.now(),
 ): string {
-	const who = shortAccount(snapshot.account);
-	const parts = [
-		`${providerUsageLabel(snapshot.provider)}${who ? ` ${who}` : ""}`,
-	];
+	const parts = [compactFooterProviderLabel(snapshot.provider)];
 	if (snapshot.serviceable === false) parts.push("spent");
-	if (snapshot.primary)
+	if (snapshot.primary) {
+		const label = windowLabel(snapshot.primary, snapshot.family, "primary");
 		parts.push(
-			`${windowLabel(snapshot.primary, snapshot.family, "primary")} ${remainingPercent(snapshot.primary)}%/${formatResetDuration(snapshot.primary.resetAt, now)}`,
+			`${label} ${remainingPercent(snapshot.primary)}%/${formatResetDuration(snapshot.primary.resetAt, now)}`,
 		);
-	if (snapshot.secondary)
+	}
+	if (snapshot.secondary) {
+		const label = windowLabel(snapshot.secondary, snapshot.family, "secondary");
 		parts.push(
-			`${windowLabel(snapshot.secondary, snapshot.family, "secondary")} ${remainingPercent(snapshot.secondary)}%/${formatResetDuration(snapshot.secondary.resetAt, now)}`,
+			`${label} ${remainingPercent(snapshot.secondary)}%/${formatResetDuration(snapshot.secondary.resetAt, now)}`,
 		);
+	}
 	if (snapshot.rateLimitResetCredits !== undefined)
 		parts.push(`reset ${snapshot.rateLimitResetCredits}`);
 	if (!snapshot.primary && !snapshot.secondary && snapshot.plan)
@@ -1177,32 +890,18 @@ export function formatUsageDetails(
 			lines.push(`Status: ${snapshot.plan}`);
 		}
 	}
-	if (snapshot.family === "antigravity" && snapshot.modelQuotas) {
-		for (const [poolName, pool] of Object.entries(snapshot.modelQuotas)) {
-			for (const [windowName, window] of [
-				["5h", pool.primary],
-				["7d", pool.secondary],
-			] as const) {
-				if (!window) continue;
-				lines.push(
-					`${poolName} ${windowName}: ${remainingPercent(window)}% left (${Math.round(window.usedPercent)}% used), resets in ${formatResetDuration(window.resetAt, now)} at ${new Date(window.resetAt).toLocaleString()}`,
-				);
-			}
-		}
-	} else {
-		for (const [position, window] of [
-			["primary", snapshot.primary],
-			["secondary", snapshot.secondary],
-		] as const) {
-			if (!window) continue;
-			const label =
-				snapshot.family === "ollama" && position === "primary"
-					? "session"
-					: windowLabel(window, snapshot.family, position);
-			lines.push(
-				`${label}: ${remainingPercent(window)}% left (${Math.round(window.usedPercent)}% used), resets in ${formatResetDuration(window.resetAt, now)} at ${new Date(window.resetAt).toLocaleString()}`,
-			);
-		}
+	for (const [position, window] of [
+		["primary", snapshot.primary],
+		["secondary", snapshot.secondary],
+	] as const) {
+		if (!window) continue;
+		const label =
+			snapshot.family === "ollama" && position === "primary"
+				? "session"
+				: windowLabel(window, snapshot.family, position);
+		lines.push(
+			`${label}: ${remainingPercent(window)}% left (${Math.round(window.usedPercent)}% used), resets in ${formatResetDuration(window.resetAt, now)} at ${new Date(window.resetAt).toLocaleString()}`,
+		);
 	}
 	if (snapshot.credits?.unlimited) lines.push("Credits: unlimited");
 	else if (snapshot.credits?.balance !== undefined)
@@ -1218,13 +917,7 @@ export function formatUsageDetails(
 export function usageColor(
 	snapshot: UsageSnapshot,
 ): "success" | "warning" | "error" {
-	const quotaWindows = snapshot.modelQuotas
-		? Object.values(snapshot.modelQuotas).flatMap((pool) => [
-				pool.primary,
-				pool.secondary,
-			])
-		: [];
-	const remaining = [snapshot.primary, snapshot.secondary, ...quotaWindows]
+	const remaining = [snapshot.primary, snapshot.secondary]
 		.filter((window): window is UsageWindow => !!window)
 		.map(remainingPercent);
 	const lowest = remaining.length > 0 ? Math.min(...remaining) : 100;

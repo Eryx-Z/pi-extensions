@@ -20,6 +20,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { CLAUDE_CODE_VERSION } from "../request-shaping.ts";
+import { placeholderKeyFor } from "../slot-proxy.ts";
 
 const AGENT_DIR = mkdtempSync(join(tmpdir(), "pmacct-test-"));
 process.env.PI_CODING_AGENT_DIR = AGENT_DIR;
@@ -131,19 +132,6 @@ test("slot display name formats family, index, direct account, and plan", () => 
 	assert.equal(maskAccount("zzh1332679071@gmail.com"), "zzh1332679071");
 	assert.equal(maskAccount("cece1332679071@gmail.com"), "cece1332679071");
 
-	assert.equal(
-		formatSlotDisplayName("antigravity", { email: "cece1332679071@gmail.com" }),
-		"Antigravity-1 (cece1332679071)",
-	);
-	assert.equal(
-		formatSlotDisplayName("antigravity-account-2", { email: "spike.zhang.ai@gmail.com" }),
-		"Antigravity-2 (spike.zhang.ai)",
-	);
-	assert.equal(
-		formatSlotDisplayName("antigravity-account-3"),
-		"Antigravity-3",
-	);
-
 	const teamJwt = codexAccessToken("team-workspace", "user-1");
 	assert.equal(
 		formatSlotDisplayName(
@@ -216,6 +204,7 @@ const ONE_ACCOUNT: Account = {
 };
 
 let messageTimestamp = 1;
+let previousHarnessShutdown: (() => void) | undefined;
 
 function setup(opts: {
 	accounts?: Account;
@@ -264,6 +253,8 @@ function setup(opts: {
 	 */
 	hostAuthStorage?: "pi-0.84";
 }) {
+	previousHarnessShutdown?.();
+	previousHarnessShutdown = undefined;
 	const accounts = opts.accounts ?? TWO_ACCOUNTS;
 	writeFileSync(AUTH, JSON.stringify(accounts));
 	writeFileSync(
@@ -545,6 +536,15 @@ function setup(opts: {
 	if (opts.omitSendUserMessage) delete pi.sendUserMessage;
 
 	piMultiAccount(pi);
+	previousHarnessShutdown = () => {
+		for (const handler of events.session_shutdown ?? []) {
+			try {
+				void handler({}, ctx);
+			} catch {
+				/* best-effort test cleanup */
+			}
+		}
+	};
 
 	const fire = async (event: string, payload: any = {}) => {
 		const handlers = events[event];
@@ -2847,99 +2847,24 @@ test("Kimi alias slots (kimi-coding-account-2) join the rotation", async () => {
 	);
 });
 
-test("Antigravity aliases join the rotation and same-family failover", async () => {
-	const accounts = {
-		antigravity: {
-			type: "oauth",
-			access: "ag-1",
-			refresh: "ag-r1",
-			projectId: "ag-project-1",
-			email: "first@example.com",
-		},
-		"antigravity-account-2": {
-			type: "oauth",
-			access: "ag-2",
-			refresh: "ag-r2",
-			projectId: "ag-project-2",
-			email: "second@example.com",
-		},
-	};
-	const t = setup({
-		accounts,
-		current: { provider: "antigravity", id: "gemini-3.8-flash" },
-		config: { autoDiscover: true, fallbacks: ["antigravity", "antigravity-account-2"] },
-	});
-	await t.fire("session_start", { reason: "startup" });
-	const slot = t.providerConfigs.get("antigravity-account-2");
-	assert.ok(slot, "the numbered Antigravity account must be registered");
-	assert.equal(slot.api, "antigravity-api");
-	assert.equal(typeof slot.streamSimple, "function");
-	assert.ok(
-		slot.models.some((model: any) => model.id === "gemini-3.8-flash"),
-		"an Antigravity slot must expose the text-model catalog",
-	);
-	await finishError(t, "antigravity", "gemini-3.8-flash", "429 RESOURCE_EXHAUSTED quota");
-	assert.ok(
-		t.rec.setModels.some((model) => model.startsWith("antigravity-account-2/")),
-		`quota exhaustion must select the other Antigravity account; got ${t.rec.setModels.join(", ")}`,
-	);
-});
-
-test("startup and rediscover refresh authenticated AGY catalogs through the host", async () => {
-	const t = setup({
-		accounts: { antigravity: { type: "oauth", access: "ag-1", refresh: "ag-r1", projectId: "project" } },
-		current: { provider: "antigravity", id: "gemini-3.8-flash" },
-		config: { autoDiscoverModels: true, childProxy: false, fallbacks: ["antigravity"] },
-	});
-	const calls: any[] = [];
-	let refreshed: (() => void) | undefined;
-	t.ctx.modelRegistry.refresh = async (options: any) => {
-		calls.push(options);
-		refreshed?.();
-		return { errors: new Map(), aborted: false };
-	};
-	await t.fire("session_start", { reason: "startup" });
-	assert.deepEqual(calls[0].providers, ["antigravity"]);
-	assert.equal(calls[0].allowNetwork, true);
-	assert.equal(calls[0].force, false);
-	assert.ok(calls[0].signal instanceof AbortSignal);
-	const rediscovered = new Promise<void>((resolve) => { refreshed = resolve; });
-	await t.command("rediscover");
-	await rediscovered;
-	assert.deepEqual(calls[1].providers, ["antigravity"]);
-	assert.equal(calls[1].force, true);
-	await t.fire("session_shutdown");
-});
-
-test("a spare Antigravity OAuth slot is registered for Google login", async () => {
+test("retired Antigravity credentials stay out of rotation and login", async () => {
 	const t = setup({
 		accounts: {
-			antigravity: {
-				type: "oauth",
-				access: "ag-1",
-				refresh: "ag-r1",
-				projectId: "ag-project-1",
-				email: "first@example.com",
-			},
+			antigravity: { type: "oauth", access: "ag-1", refresh: "ag-r1", email: "first@example.com" },
+			"antigravity-account-2": { type: "oauth", access: "ag-2", refresh: "ag-r2", email: "second@example.com" },
+			"openai-codex": { type: "oauth", access: "c", refresh: "cr" },
 		},
+		current: { provider: "openai-codex", id: "gpt-5.5" },
+		config: { includeOtherProviders: true, autoDiscover: true },
 	});
-	await t.fire("session_start");
-	const slot = t.providerConfigs.get("antigravity-account-2");
-	assert.ok(slot, "the next Antigravity login slot must be present in /login");
-	assert.equal(typeof slot.oauth.login, "function");
-	assert.deepEqual(
-		JSON.parse(slot.oauth.getApiKey({
-			access: "token",
-			projectId: "project",
-			email: "first@example.com",
-		})),
-		{ token: "token", projectId: "project" },
-	);
+	await t.fire("session_start", { reason: "startup" });
+	const startup = t.rec.notifies.find((notice) => /account\(s\) in rotation/.test(notice)) ?? "";
+	assert.match(startup, /1 account\(s\) in rotation/);
+	assert.equal(t.providerConfigs.has("antigravity"), false);
+	assert.equal(t.providerConfigs.has("antigravity-account-2"), false);
 	await t.command("add agy");
-	const notice = t.rec.notifies.at(-1) ?? "";
-	assert.match(notice, /antigravity-account-2/);
-	assert.match(notice, /Google sign-in/);
-	assert.doesNotMatch(notice, /auth\.json/);
+	assert.match(t.rec.notifies.at(-1) ?? "", /usage: \/multi-account add/);
+	assert.doesNotMatch(t.rec.notifies.at(-1) ?? "", /Google sign-in/);
 });
 
 test("a Kimi subscription slot is registered so /login can offer it", async () => {
@@ -3173,12 +3098,35 @@ test("a failover switch never rewrites settings.json — the user's base config 
 	assert.equal(settings.defaultModel, "cursor-grok-4.6");
 });
 
-test("session_shutdown remembers the live model so the next start can restore it", async () => {
+test("session_shutdown avoids clobbering lastUserModel on idle exit and persists only when user changed models", async () => {
+	const idle = setup({
+		accounts: {
+			anthropic: { type: "oauth", access: "a", refresh: "ar" },
+			cursor: { type: "oauth", access: "c", refresh: "cr" },
+		},
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		seedState: {
+			stateVersion: 5,
+			lastUserModel: { provider: "cursor", id: "cursor-grok-4.6" },
+			lastModelByFamily: { cursor: "cursor-grok-4.6" },
+		},
+	});
+	await idle.fire("session_shutdown");
+	assert.deepEqual(
+		idle.readState().lastUserModel,
+		{ provider: "cursor", id: "cursor-grok-4.6" },
+		"an idle session exiting without a user model change must not overwrite peer lastUserModel",
+	);
+
 	const t = setup({
 		accounts: {
 			cursor: { type: "oauth", access: "c", refresh: "cr" },
 		},
 		current: { provider: "cursor", id: "cursor-grok-4.6" },
+	});
+	await t.fire("model_select", {
+		model: { provider: "cursor", id: "cursor-grok-4.6" },
+		source: "manual",
 	});
 	await t.fire("session_shutdown");
 	const state = t.readState();
@@ -5852,15 +5800,15 @@ test("status is compact by default and points to full diagnostics", async () => 
 	await t.command("", "status");
 
 	const status = t.rec.notifies.at(-1) ?? "";
-	assert.match(status, /账号\s+owner@example\.com: Team/);
+	assert.match(status, /账号\s+o\*\*\*@example\.com: Team/);
 	assert.match(status, /模型\s+gpt-5.6-sol/);
 	assert.match(status, /全部额度/);
 	assert.match(
 		status,
-		/owner@example\.com: Team\s+当前\n\s+可用\s+│\s+5h 剩余 86%[^\n]*后重置\s+│\s+7d 剩余 75%[^\n]*后重置\s+│\s+可用重置次数 2/,
+		/o\*\*\*@example\.com: Team\s+当前\n\s+可用\s+│\s+5h 剩余 86%[^\n]*后重置\s+│\s+7d 剩余 75%[^\n]*后重置\s+│\s+可用重置次数 2/,
 		"Codex verdict, 5h/7d countdowns, and available reset count should share one row",
 	);
-	assert.match(status, /claude@example\.com: Pro\n\s+可用\s+│\s+5h 剩余 70%/);
+	assert.match(status, /c\*\*\*@example\.com: Pro\n\s+可用\s+│\s+5h 剩余 70%/);
 	assert.doesNotMatch(status, /Codex A2|account-2/);
 	assert.match(status, /\/status full/);
 	assert.doesNotMatch(status, /Registered login slots/);
@@ -5871,45 +5819,6 @@ test("status is compact by default and points to full diagnostics", async () => 
 	const fullStatus = t.rec.notifies.at(-1) ?? "";
 	assert.match(fullStatus, /Registered login slots/);
 	assert.match(fullStatus, /Resume watchdog/);
-});
-
-test("status displays Antigravity Gemini and Claude/3P quotas compactly in a single row", async () => {
-	const now = Date.now();
-	const t = setup({
-		accounts: {
-			antigravity: { type: "oauth", access: "ag-1", refresh: "ag-r1", projectId: "ag-project-1" },
-		},
-		current: { provider: "antigravity", id: "gemini-3.8-flash" },
-		config: { autoDiscover: true, fallbacks: ["antigravity"] },
-		seedState: {
-			stateVersion: 5,
-			usageByProvider: {
-				antigravity: {
-					provider: "antigravity", family: "antigravity", fetchedAt: now,
-					credentialHash: createHash("sha256").update("ag-1").digest("hex").slice(0, 12),
-					account: "owner@example.com", plan: "Google AI Pro", serviceable: true,
-					primary: { usedPercent: 23, resetAt: now + 5 * 86_400_000, windowSeconds: 604800 },
-					secondary: { usedPercent: 11, resetAt: now + 4 * 3_600_000, windowSeconds: 18000 },
-					modelQuotas: {
-						Gemini: {
-							primary: { usedPercent: 0, resetAt: now + 5 * 3_600_000, windowSeconds: 18000 },
-							secondary: { usedPercent: 23, resetAt: now + 5 * 86_400_000, windowSeconds: 604800 },
-						},
-						Claude: {
-							primary: { usedPercent: 11, resetAt: now + 4 * 3_600_000, windowSeconds: 18000 },
-							secondary: { usedPercent: 5, resetAt: now + 6 * 86_400_000, windowSeconds: 604800 },
-						},
-					},
-				},
-			},
-		},
-	});
-	await t.command("", "status");
-	const status = t.rec.notifies.at(-1) ?? "";
-	assert.match(
-		status,
-		/owner@example\.com: Google AI Pro\s+当前\n {4}可用 {2}│ {2}Gemini 5h 100% \/ 7d 77% {2}│ {2}Claude 5h 89% \/ 7d 95%/,
-	);
 });
 
 test("status renders cached quota immediately and refreshes expired accounts in the background", {
@@ -6812,8 +6721,8 @@ test("the footer says how many other accounts are ready, so 'switch to what?' ha
 	const footer = t.rec.statuses.at(-1)?.value ?? "";
 	assert.match(
 		footer,
-		/someone/,
-		`the footer must name the account in use; got: ${footer}`,
+		/Codex A2/,
+		`the footer must name the account slot in use; got: ${footer}`,
 	);
 	assert.match(
 		footer,
@@ -7911,7 +7820,6 @@ test("/multi-account priority distinguishes reset from clear", async () => {
 		"anthropic",
 		"openai-codex",
 		"kimi-coding",
-		"antigravity",
 		"cursor",
 		"qwen",
 		"ollama",
@@ -8000,9 +7908,9 @@ test("a model switch does not judge settings.json startup defaults as live state
 		settings: { defaultProvider: "openai-codex", defaultModel: "gpt-5.5" },
 	});
 	await t.fire("session_start");
-	t.setCurrent("antigravity", "gemini-3.8-flash");
+	t.setCurrent("kimi-coding", "k3");
 	await t.fire("model_select", {
-		model: { provider: "antigravity", id: "gemini-3.8-flash" },
+		model: { provider: "kimi-coding", id: "k3" },
 	});
 	await t.fire("agent_start");
 	assert.equal(
@@ -8372,159 +8280,13 @@ test("the Codex slot is published with a token-shaped placeholder that carries n
 		// The user's real account id must not be in a file a child reads — the proxy substitutes it.
 		assert.equal(
 			payload["https://api.openai.com/auth"].chatgpt_account_id,
-			"pi-multi-account-proxy",
+			placeholderKeyFor("anthropic"),
 		);
 		assert.equal(published.includes("acct-real-9"), false);
 		assert.equal(published.includes("c-tok-2"), false);
 	} finally {
 		await t.fire("session_shutdown");
 		rmSync(MODELS, { force: true });
-	}
-});
-
-test("status preserves Antigravity subscription and quotas across mid-session OAuth token rotation and sibling-process updates", {
-	concurrency: false,
-}, async () => {
-	const now = Date.now();
-	const originalFetch = globalThis.fetch;
-	const authHeaders: string[] = [];
-	globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
-		const url = String(input);
-		const authHeader = (init?.headers as Record<string, string> | undefined)?.Authorization;
-		if (authHeader) authHeaders.push(authHeader);
-		await wait(40);
-		if (url.includes("loadCodeAssist")) {
-			return Response.json({ paidTier: { name: "Google AI Ultra" } });
-		}
-		if (url.includes("retrieveUserQuotaSummary")) {
-			return Response.json({
-				groups: [
-					{
-						displayName: "Gemini",
-						buckets: [
-							{ window: "5h", remainingFraction: 0.85, resetTime: new Date(now + 18_000_000).toISOString() },
-							{ window: "weekly", remainingFraction: 0.95, resetTime: new Date(now + 604_800_000).toISOString() },
-						],
-					},
-				],
-			});
-		}
-		return Response.json({});
-	}) as typeof fetch;
-
-	const hash = (token: string) =>
-		createHash("sha256").update(token).digest("hex").slice(0, 12);
-	const t = setup({
-		accounts: {
-			"antigravity-account-3": {
-				type: "oauth",
-				access: "ag-token-old",
-				refresh: "ag-refresh",
-				projectId: "aicode-consumers",
-				email: "eryx@example.com",
-			},
-		},
-		current: { provider: "antigravity-account-3", id: "gemini-3.8-flash" },
-		config: { autoDiscover: true, showUsage: false, fallbacks: ["antigravity-account-3"] },
-		statusFetch: globalThis.fetch,
-		seedState: {
-			stateVersion: 5,
-			usageByProvider: {
-				"antigravity-account-3": {
-					provider: "antigravity-account-3",
-					family: "antigravity",
-					fetchedAt: now - 60_000,
-					credentialHash: hash("ag-token-old"),
-					account: "eryx@example.com",
-					plan: "Google AI Ultra",
-					serviceable: true,
-					primary: { usedPercent: 10, resetAt: now + 18_000_000, windowSeconds: 18_000 },
-					modelQuotas: {
-						Gemini: {
-							primary: { usedPercent: 10, resetAt: now + 18_000_000, windowSeconds: 18_000 },
-							secondary: { usedPercent: 3, resetAt: now + 604_800_000, windowSeconds: 604_800 },
-						},
-					},
-				},
-			},
-		},
-	});
-
-	try {
-		// 1. Mid-session 55-minute Google OAuth token rotation on the same account.
-		await wait(5);
-		writeFileSync(
-			AUTH,
-			JSON.stringify({
-				"antigravity-account-3": {
-					type: "oauth",
-					access: "ag-token-rotated",
-					refresh: "ag-refresh",
-					projectId: "aicode-consumers",
-					email: "eryx@example.com",
-				},
-			}),
-		);
-
-		await t.command("", "status");
-		const immediate = t.rec.notifies.at(-1) ?? "";
-		assert.doesNotMatch(immediate, /订阅未知|尚未加载/, `status must not blank on OAuth token rotation: ${immediate}`);
-		assert.match(immediate, /eryx@example\.com: Google AI Ultra\s+当前/);
-		assert.match(immediate, /Gemini 5h 90% \/ 7d 97%/);
-
-		// Wait for the background refresh triggered by the rotated credentialHash.
-		await wait(180);
-		assert.ok(authHeaders.includes("Bearer ag-token-rotated"), "rotated token must still trigger a background refresh");
-		await t.command("", "status");
-		assert.match(t.rec.notifies.at(-1) ?? "", /Gemini 5h 85% \/ 7d 95%/);
-
-		// 2. Re-login into a DIFFERENT Google account drops the previous user's plan/quotas,
-		//    while still surfacing the new email from auth.json instead of bare "Antigravity".
-		await wait(5);
-		writeFileSync(
-			AUTH,
-			JSON.stringify({
-				"antigravity-account-3": {
-					type: "oauth",
-					access: "ag-token-other-user",
-					refresh: "ag-refresh-other",
-					projectId: "aicode-consumers",
-					email: "other@example.com",
-				},
-			}),
-		);
-		await t.command("", "status");
-		const relogged = t.rec.notifies.at(-1) ?? "";
-		assert.doesNotMatch(relogged, /Google AI Ultra|eryx@example\.com/);
-		assert.match(relogged, /other@example\.com: 订阅未知\s+当前/);
-
-		// 3. Sibling Pi process writes a fresher snapshot for the new account to disk; status picks it up.
-		const stateOnDisk = t.readState();
-		writeFileSync(
-			STATE,
-			JSON.stringify({
-				...stateOnDisk,
-				usageByProvider: {
-					"antigravity-account-3": {
-						provider: "antigravity-account-3",
-						family: "antigravity",
-						fetchedAt: Date.now() + 1_000,
-						credentialHash: hash("ag-token-other-user"),
-						account: "other@example.com",
-						plan: "Google AI Pro",
-						serviceable: true,
-						primary: { usedPercent: 0, resetAt: now + 18_000_000, windowSeconds: 18_000 },
-					},
-				},
-			}),
-		);
-		await t.command("", "status");
-		const fromSibling = t.rec.notifies.at(-1) ?? "";
-		assert.match(fromSibling, /other@example\.com: Google AI Pro\s+当前/);
-		assert.doesNotMatch(fromSibling, /尚未加载/);
-	} finally {
-		globalThis.fetch = originalFetch;
-		await t.fire("session_shutdown");
 	}
 });
 
@@ -8591,3 +8353,95 @@ test("session_start does not block interactive startup on slow remote quota and 
 		globalThis.fetch = originalFetch;
 	}
 });
+
+test("MALFORMED_FUNCTION_CALL retries immediately on the same model without cooling down or rotating accounts", async () => {
+	rmSync(DEBUG_LOG, { force: true });
+	const t = setup({
+		accounts: {
+			"openai-codex-account-2": {
+				type: "oauth",
+				access: "codex-tok-2",
+				refresh: "codex-ref-2",
+				accountId: "acct-2",
+			},
+		},
+		current: { provider: "openai-codex-account-2", id: "gpt-5.5" },
+		config: { maxAutoContinuesPerPrompt: 2 },
+		omitContinueAgent: true,
+	});
+	await t.fire("session_start");
+	await t.fire("before_agent_start", { prompt: "launch polish subagent" });
+	await t.fire("agent_start", {});
+
+	// 1st malformed tool call: immediate followUp continuation on the same model, zero cooldown, zero switches.
+	await finishError(
+		t,
+		"openai-codex-account-2",
+		"gpt-5.5",
+		"Provider stopped with: MALFORMED_FUNCTION_CALL",
+	);
+	const classified = readDebugLog()
+		.filter(
+			(entry) =>
+				entry.kind === "assistant_error" &&
+				entry.provider === "openai-codex-account-2",
+		)
+		.at(-1)?.classified;
+	assert.equal(classified, "malformed_tool_call");
+	assert.deepEqual(t.rec.setModels, []);
+	assert.equal(
+		t.readState().exhaustedUntilByProvider?.["openai-codex-account-2"] ?? 0,
+		0,
+	);
+	assert.equal(t.rec.sent.length, 1);
+	assert.equal(t.rec.sent[0].options?.deliverAs, "followUp");
+
+	// 2nd consecutive malformed tool call in the followUp turn: still retries up to maxAutoContinuesPerPrompt.
+	await t.fire("before_agent_start", {});
+	await t.fire("agent_start", {});
+	await finishError(
+		t,
+		"openai-codex-account-2",
+		"gpt-5.5",
+		"Provider stopped with: MALFORMED_FUNCTION_CALL",
+	);
+	assert.equal(t.rec.sent.length, 2);
+
+	// 3rd consecutive failure hits maxAutoContinuesPerPrompt (2) and stops cleanly.
+	await t.fire("before_agent_start", {});
+	await t.fire("agent_start", {});
+	await finishError(
+		t,
+		"openai-codex-account-2",
+		"gpt-5.5",
+		"Provider stopped with: MALFORMED_FUNCTION_CALL",
+	);
+	assert.equal(t.rec.sent.length, 2);
+});
+
+test("debugLog can be disabled on disk without restarting the session", async () => {
+	const debugPath = join(AGENT_DIR, "provider-failover-debug.log");
+	rmSync(debugPath, { force: true });
+	const t = setup({
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		config: { debugLog: true, autoContinue: false },
+	});
+	await t.fire("session_start");
+	assert.equal(existsSync(debugPath), true);
+	const sizeBefore = readFileSync(debugPath, "utf8").length;
+	assert.ok(sizeBefore > 0);
+
+	// Flip debugLog to false on disk without calling reload or restarting.
+	await wait(10);
+	const rawCfg = JSON.parse(readFileSync(CONFIG, "utf8"));
+	writeFileSync(CONFIG, JSON.stringify({ ...rawCfg, debugLog: false }));
+
+	await finishError(t, "anthropic", "claude-opus-4-8", "429 usage limit reached");
+	assert.equal(
+		readFileSync(debugPath, "utf8").length,
+		sizeBefore,
+		"logEvent must stop appending immediately once provider-failover.json sets debugLog: false",
+	);
+});
+
+

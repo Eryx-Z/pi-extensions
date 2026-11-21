@@ -13,7 +13,6 @@ export type ProviderFamily =
 	| "anthropic"
 	| "openai-codex"
 	| "kimi-coding"
-	| "antigravity"
 	| "qwen"
 	| "ollama"
 	| "cursor";
@@ -32,8 +31,6 @@ const FAMILY_KEYWORDS = new Set([
 	"claude",
 	"codex",
 	"openai",
-	"antigravity",
-	"agy",
 	"cursor",
 	"ollama",
 	"qwen",
@@ -48,7 +45,6 @@ export function parseFamilyArg(raw: string | undefined): ProviderFamily | undefi
 	if (familyRaw === "qwen" || familyRaw === "alibaba") return "qwen";
 	if (familyRaw === "cursor") return "cursor";
 	if (familyRaw === "kimi" || familyRaw === "kimi-coding") return "kimi-coding";
-	if (familyRaw === "antigravity" || familyRaw === "agy") return "antigravity";
 	return undefined;
 }
 
@@ -115,8 +111,6 @@ export function classifyProvider(
 	if (isCursorProviderId(id)) return "cursor";
 	if (id === "kimi-coding" || /^kimi-coding-account-\d+$/.test(id))
 		return "kimi-coding";
-	if (id === "antigravity" || /^antigravity-account-\d+$/.test(id))
-		return "antigravity";
 	return undefined;
 }
 
@@ -141,9 +135,7 @@ export function slotId(
 				? CODEX_BASE
 				: family === "kimi-coding"
 					? "kimi-coding"
-					: family === "antigravity"
-						? "antigravity"
-						: family === "qwen"
+					: family === "qwen"
 							? qwenProvider
 							: family === "cursor"
 								? CURSOR_BASE
@@ -207,4 +199,9 @@ export function sameModelIdentity(
 /** Family when we know one; otherwise the un-numbered provider id (`zai` from `zai-account-2`). */
 export function accountGroup(id: string, qwenProvider: string): string {
 	return classifyProvider(id, qwenProvider) ?? id.replace(/-account-\d+$/, "");
+}
+
+/** Stored AGY slots are no longer a provider. Do not rediscover them as generic accounts. */
+export function isRetiredAntigravityProvider(id: string): boolean {
+	return id === "antigravity" || /^antigravity-account-\d+$/.test(id);
 }

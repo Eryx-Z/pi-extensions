@@ -161,17 +161,35 @@ export function renderHandoffRecord(
 	return lines.join("\n");
 }
 
+export interface PreserveInterruptedOptions {
+	/**
+	 * Controls whether `stopReason === "aborted"` turns are preserved alongside `"error"` turns.
+	 * Defaults to `true` for standalone callers; live session hooks pass a predicate so manual
+	 * user `Esc` cancellations are not rewritten into permanent `[handoff:interrupted-turn]` blocks.
+	 */
+	includeAborted?: boolean | ((message: any) => boolean);
+}
+
 /**
  * Replace every interrupted assistant message with a verbatim `user` handoff record and
  * fold in (and remove) the tool results that belonged to it. Returns the original array
  * when there is nothing to preserve, so the caller can skip the hook result entirely.
  */
-export function preserveInterruptedTurns(messages: any[]): any[] {
+export function preserveInterruptedTurns(
+	messages: any[],
+	options?: PreserveInterruptedOptions,
+): any[] {
 	if (!Array.isArray(messages) || messages.length === 0) return messages;
+	const includeAborted = options?.includeAborted ?? true;
+	const shouldIncludeAborted = (message: any): boolean =>
+		typeof includeAborted === "function"
+			? includeAborted(message)
+			: includeAborted;
 	const interrupted = messages.filter(
 		(message: any) =>
 			message?.role === "assistant" &&
-			(message.stopReason === "error" || message.stopReason === "aborted"),
+			(message.stopReason === "error" ||
+				(message.stopReason === "aborted" && shouldIncludeAborted(message))),
 	);
 	if (interrupted.length === 0) return messages;
 

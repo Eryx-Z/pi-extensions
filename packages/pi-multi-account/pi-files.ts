@@ -1,7 +1,9 @@
 /** Published Pi file adapters: shape inspection, child visibility and atomic slot catalogs. */
 
-import { readFileSync, existsSync, writeFileSync, renameSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { readFileSync, existsSync, writeFileSync, renameSync, rmSync } from "node:fs";
 import { MODELS_CONFIG_PATH, SETTINGS_PATH, AUTH_PATH } from "./agent-paths.ts";
+import { withFileLockSync } from "./file-lock.ts";
 import { type ShapeVerdict, checkAuthShape, checkModelsShape } from "./pi-contract.ts";
 import { type ChildUsability, classifyChildUsability } from "./child-usability.ts";
 import { isRecord } from "./request-shaping.ts";
@@ -113,6 +115,61 @@ export function inspectPiContract(): ShapeVerdict[] {
  * numbered slots nor present in models.json is one Pi defines itself, and Pi then owns its auth
  * flow — which is the only case where an OAuth credential works for a child at all.
  */
+/**
+ * Providers shipped natively in @earendil-works/pi-ai. Extension-registered providers
+ * such as `cursor` and `grok-cli` are NOT host built-ins, so an
+ * extension-free bare child cannot resolve them without a published models.json route.
+ */
+export const HOST_BUILTIN_PROVIDERS: ReadonlySet<string> = new Set([
+	"amazon-bedrock",
+	"ant-ling",
+	"anthropic",
+	"azure",
+	"baseten",
+	"cerebras",
+	"cloudflare-ai-gateway",
+	"cloudflare-workers-ai",
+	"deepseek",
+	"fireworks",
+	"github-copilot",
+	"google",
+	"google-vertex",
+	"groq",
+	"huggingface",
+	"kimi-coding",
+	"meta",
+	"minimax",
+	"minimax-cn",
+	"mistral",
+	"moonshotai",
+	"moonshotai-cn",
+	"nvidia",
+	"openai",
+	"openai-codex",
+	"opencode",
+	"opencode-go",
+	"openrouter",
+	"qwen-token-plan",
+	"qwen-token-plan-cn",
+	"qwen-token-plan-individual",
+	"qwen-token-plan-individual-cn",
+	"radius",
+	"together",
+	"typesafe",
+	"vercel-ai-gateway",
+	"xai",
+	"xiaomi",
+	"xiaomi-token-plan-ams",
+	"xiaomi-token-plan-cn",
+	"xiaomi-token-plan-sgp",
+	"zai",
+	"zai-coding-cn",
+]);
+
+export function isHostBuiltinProvider(providerId: string): boolean {
+	return HOST_BUILTIN_PROVIDERS.has(providerId);
+}
+
 export function slotsAsAChildSeesThem(
 	slotIds: readonly string[],
 	auth: Record<string, { type?: string }>,
@@ -137,7 +194,7 @@ export function slotsAsAChildSeesThem(
 					: credentialType === "api_key"
 						? "api_key"
 						: "none",
-			builtin: !/-account-\d+$/.test(slotId) && entry === undefined,
+			builtin: isHostBuiltinProvider(slotId) && entry === undefined,
 			publishedApiKey:
 				typeof entry?.apiKey === "string" ? entry.apiKey : undefined,
 			publishedBaseUrl:
@@ -252,30 +309,102 @@ function nativeModelEntries(models: unknown[]): NativeModelEntry[] {
  * Failover state lives in provider-failover-state.json, our own file.
  * Merge-only: existing user entries and unrelated keys are preserved verbatim.
  */
+export function readPublishedNativeSlot(provider: string): Record<string, unknown> | undefined {
+	try {
+		if (!existsSync(MODELS_CONFIG_PATH)) return undefined;
+		const parsed = JSON.parse(readFileSync(MODELS_CONFIG_PATH, "utf8"));
+		const existing = parsed?.providers?.[provider];
+		return isRecord(existing) ? structuredClone(existing) : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+function writeModelsConfigAtomically(next: unknown): void {
+	const tmp = `${MODELS_CONFIG_PATH}.${process.pid}.${randomUUID()}.tmp`;
+	try {
+		writeFileSync(tmp, `${JSON.stringify(next, null, 2)}\n`, {
+			encoding: "utf8",
+			mode: 0o600,
+		});
+		renameSync(tmp, MODELS_CONFIG_PATH);
+	} finally {
+		try {
+			rmSync(tmp, { force: true });
+		} catch {
+			/* ignore cleanup errors */
+		}
+	}
+}
+
+export function shiftNativeSlotEntries(
+	shifts: ReadonlyArray<{ from: string; to: string }>,
+): void {
+	if (shifts.length === 0) return;
+	try {
+		withFileLockSync(MODELS_CONFIG_PATH, () => {
+			if (!existsSync(MODELS_CONFIG_PATH)) return;
+			const parsed = JSON.parse(readFileSync(MODELS_CONFIG_PATH, "utf8"));
+			const providers = isRecord(parsed?.providers) ? { ...parsed.providers } : undefined;
+			if (!providers) return;
+			let changed = false;
+			for (const { from, to } of shifts) {
+				if (isRecord(providers[from])) {
+					const entry: Record<string, unknown> = { ...providers[from] };
+					if (typeof entry.baseUrl === "string") {
+						entry.baseUrl = entry.baseUrl.replaceAll(from, to);
+					}
+					providers[to] = entry;
+					delete providers[from];
+					changed = true;
+				}
+			}
+			if (changed) {
+				writeModelsConfigAtomically({ ...parsed, providers });
+			}
+		});
+	} catch {
+		/* models.json locked/corrupt */
+	}
+}
+
+export function restorePublishedNativeSlot(
+	provider: string,
+	previous: Record<string, unknown> | undefined,
+	expectedBaseUrl: string,
+): void {
+	try {
+		withFileLockSync(MODELS_CONFIG_PATH, () => {
+			if (!existsSync(MODELS_CONFIG_PATH)) return;
+			const parsed = JSON.parse(readFileSync(MODELS_CONFIG_PATH, "utf8"));
+			const providers = isRecord(parsed?.providers) ? parsed.providers : {};
+			const current = providers[provider];
+			if (!isRecord(current) || current.baseUrl !== expectedBaseUrl) return;
+			const nextProviders = { ...providers };
+			if (previous) nextProviders[provider] = previous;
+			else delete nextProviders[provider];
+			writeModelsConfigAtomically({ ...parsed, providers: nextProviders });
+		});
+	} catch {
+		/* models.json locked/corrupt */
+	}
+}
+
 export function unprovisionNativeSlot(provider: string): void {
 	try {
-		if (!existsSync(MODELS_CONFIG_PATH)) return;
-		const raw = readFileSync(MODELS_CONFIG_PATH, "utf8");
-		const parsed = JSON.parse(raw);
-		const providers =
-			typeof parsed?.providers === "object" && parsed.providers !== null
-				? parsed.providers
-				: {};
-		if (!providers[provider]) return;
-		const nextProviders = { ...providers };
-		delete nextProviders[provider];
-		const next = { ...parsed, providers: nextProviders };
-		const tmp = `${MODELS_CONFIG_PATH}.multi-account.tmp`;
-		writeFileSync(
-			tmp,
-			`${JSON.stringify(next, null, 2)}
-`,
-			{
-				encoding: "utf8",
-				mode: 0o600,
-			},
-		);
-		renameSync(tmp, MODELS_CONFIG_PATH);
+		withFileLockSync(MODELS_CONFIG_PATH, () => {
+			if (!existsSync(MODELS_CONFIG_PATH)) return;
+			const raw = readFileSync(MODELS_CONFIG_PATH, "utf8");
+			const parsed = JSON.parse(raw);
+			const providers =
+				typeof parsed?.providers === "object" && parsed.providers !== null
+					? parsed.providers
+					: {};
+			if (!providers[provider]) return;
+			const nextProviders = { ...providers };
+			delete nextProviders[provider];
+			writeModelsConfigAtomically({ ...parsed, providers: nextProviders });
+		});
 	} catch {
 		/* models.json locked/corrupt */
 	}
@@ -294,38 +423,29 @@ export function provisionNativeSlot(
 		};
 		if (entry.apiKey) normalized.apiKey = entry.apiKey;
 		if (entry.compat) normalized.compat = entry.compat;
-		const raw = existsSync(MODELS_CONFIG_PATH)
-			? readFileSync(MODELS_CONFIG_PATH, "utf8")
-			: "{}";
-		const parsed = JSON.parse(raw);
-		const providers =
-			typeof parsed?.providers === "object" && parsed.providers !== null
-				? parsed.providers
-				: {};
-		const existing = providers[provider];
-		if (
-			existing?.baseUrl === normalized.baseUrl &&
-			existing?.api === normalized.api &&
-			existing?.apiKey === normalized.apiKey &&
-			JSON.stringify(existing?.models ?? []) === JSON.stringify(models)
-		) {
-			return; // already provisioned — do not touch the file
-		}
-		const next = {
-			...parsed,
-			providers: { ...providers, [provider]: normalized },
-		};
-		const tmp = `${MODELS_CONFIG_PATH}.multi-account.tmp`;
-		writeFileSync(
-			tmp,
-			`${JSON.stringify(next, null, 2)}
-`,
-			{
-				encoding: "utf8",
-				mode: 0o600,
-			},
-		);
-		renameSync(tmp, MODELS_CONFIG_PATH);
+		withFileLockSync(MODELS_CONFIG_PATH, () => {
+			const raw = existsSync(MODELS_CONFIG_PATH)
+				? readFileSync(MODELS_CONFIG_PATH, "utf8")
+				: "{}";
+			const parsed = JSON.parse(raw);
+			const providers =
+				typeof parsed?.providers === "object" && parsed.providers !== null
+					? parsed.providers
+					: {};
+			const existing = providers[provider];
+			if (
+				existing?.baseUrl === normalized.baseUrl &&
+				existing?.api === normalized.api &&
+				existing?.apiKey === normalized.apiKey &&
+				JSON.stringify(existing?.models ?? []) === JSON.stringify(models)
+			) {
+				return; // already provisioned — do not touch the file
+			}
+			writeModelsConfigAtomically({
+				...parsed,
+				providers: { ...providers, [provider]: normalized },
+			});
+		});
 	} catch {
 		/* models.json locked/corrupt — the extension registry still works */
 	}

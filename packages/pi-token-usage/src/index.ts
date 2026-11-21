@@ -1,6 +1,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { aggregateUsage } from "./aggregate.js";
-import { appendLedgerRecord, scanSessions } from "./scanner.js";
+import { appendLedgerRecord, getSessionsDirectory, getTokenLedgerPath, readUsageSnapshot, scanSessions } from "./scanner.js";
 import type { TimeWindow } from "./types.js";
 import { renderPlainReport, showTokensUi } from "./ui.js";
 
@@ -39,12 +39,17 @@ export default function tokenUsageExtension(pi: ExtensionAPI): void {
       }
 
       try {
-        const result = await scanSessions();
+        const directory = getSessionsDirectory();
+        const options = { ledgerPath: getTokenLedgerPath() };
+        const rescan = () => scanSessions(directory, options);
         if (ctx.mode === "tui") {
-          await showTokensUi(ctx, result, window, () => scanSessions());
+          // Mount immediately, then show cached/ledger totals while reconciling history.
+          await showTokensUi(ctx, readUsageSnapshot(directory, options), window, rescan, true);
           return;
         }
 
+        // RPC/headless callers still receive a single, reconciled final report.
+        const result = await rescan();
         const report = renderPlainReport(
           aggregateUsage(result.records, window),
           window,
@@ -65,29 +70,46 @@ export default function tokenUsageExtension(pi: ExtensionAPI): void {
   if (typeof pi.on === "function") {
     pi.on("turn_end", async (event) => {
       try {
-        const raw = event as unknown as { message?: Record<string, unknown>; id?: string };
+        const raw = event as unknown as {
+          messageEntryId?: unknown;
+          id?: unknown;
+          timestamp?: unknown;
+          message?: Record<string, unknown>;
+        };
         const message = raw.message;
         if (!message || message.role !== "assistant" || !message.usage) return;
         const usage = message.usage as Record<string, unknown>;
         const cost = usage.cost as Record<string, unknown> | undefined;
         const id =
-          typeof raw.id === "string"
-            ? raw.id
-            : typeof message.id === "string"
-              ? message.id
-              : undefined;
+          typeof raw.messageEntryId === "string" && raw.messageEntryId.length > 0
+            ? raw.messageEntryId
+            : typeof raw.id === "string" && raw.id.length > 0
+              ? raw.id
+              : typeof message.id === "string" && message.id.length > 0
+                ? message.id
+                : undefined;
         if (!id) return;
+        const parseTs = (val: unknown): number | undefined => {
+          if (typeof val === "number" && Number.isFinite(val)) return val;
+          if (typeof val === "string") {
+            const parsed = Date.parse(val);
+            return Number.isFinite(parsed) ? parsed : undefined;
+          }
+          return undefined;
+        };
+        const timestamp =
+          parseTs(raw.timestamp) ?? parseTs(message.timestamp) ?? Date.now();
         await appendLedgerRecord({
           id,
-          timestamp: Date.now(),
-          provider: typeof message.provider === "string" ? message.provider : "unknown",
-          model: typeof message.model === "string" ? message.model : "unknown",
-          inputTokens: typeof usage.input === "number" ? usage.input : 0,
-          outputTokens: typeof usage.output === "number" ? usage.output : 0,
-          cacheReadTokens: typeof usage.cacheRead === "number" ? usage.cacheRead : 0,
-          cacheWriteTokens: typeof usage.cacheWrite === "number" ? usage.cacheWrite : 0,
-          totalTokens: typeof usage.totalTokens === "number" ? usage.totalTokens : 0,
-          costUSD: typeof cost?.total === "number" ? cost.total : 0,
+          timestamp,
+          provider: typeof message.provider === "string" && message.provider.trim().length > 0 ? message.provider : "unknown",
+          model: typeof message.model === "string" && message.model.trim().length > 0 ? message.model : "unknown",
+          inputTokens: typeof usage.input === "number" && Number.isFinite(usage.input) && usage.input >= 0 ? usage.input : 0,
+          outputTokens: typeof usage.output === "number" && Number.isFinite(usage.output) && usage.output >= 0 ? usage.output : 0,
+          cacheReadTokens: typeof usage.cacheRead === "number" && Number.isFinite(usage.cacheRead) && usage.cacheRead >= 0 ? usage.cacheRead : 0,
+          cacheWriteTokens: typeof usage.cacheWrite === "number" && Number.isFinite(usage.cacheWrite) && usage.cacheWrite >= 0 ? usage.cacheWrite : 0,
+          totalTokens: typeof usage.totalTokens === "number" && Number.isFinite(usage.totalTokens) && usage.totalTokens >= 0 ? usage.totalTokens : 0,
+          costUSD: typeof cost?.total === "number" && Number.isFinite(cost.total) && cost.total >= 0 ? cost.total : 0,
         });
       } catch {
         // Non-fatal

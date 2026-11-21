@@ -2,6 +2,8 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 type SessionContext = { sessionManager: { getSessionId(): string; getLeafId?: () => string } };
 
+const registeredApis = new WeakSet<object>();
+
 export function registerSessionLifecycleHooks(
   pi: ExtensionAPI,
   dependencies: {
@@ -12,6 +14,8 @@ export function registerSessionLifecycleHooks(
     debug?: (event: string, data: Record<string, unknown>) => void;
   },
 ): void {
+  if (!pi || typeof pi !== "object" || registeredApis.has(pi)) return;
+  registeredApis.add(pi);
   const cleanupCurrentSession = (_event: unknown, ctx: SessionContext) => {
     dependencies.debug?.("session.cleanup_hook", {
       sessionId: ctx.sessionManager.getSessionId(),

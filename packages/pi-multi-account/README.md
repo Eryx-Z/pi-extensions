@@ -1,12 +1,12 @@
 # pi-multi-account
 
-Automatic multi-account failover & rotation for [Pi Agent](https://pi.dev/), across **Anthropic (Claude)**, **OpenAI / ChatGPT Codex**, **Google Antigravity**, **Kimi For Coding**, **Cursor**, **Qwen / Alibaba**, and **Ollama**.
+Automatic multi-account failover & rotation for [Pi Agent](https://pi.dev/), across **Anthropic (Claude)**, **OpenAI / ChatGPT Codex**, **Kimi For Coding**, **Cursor**, **Qwen / Alibaba**, and **Ollama**.
 
 When the account you are using hits a quota or rate limit, `pi-multi-account` transparently switches to the next authenticated account/model and (optionally) resumes the interrupted task — so a long agent run does not die just because one account ran out of budget.
 
 ## RPC subagent model inheritance
 
-For `pi-agent-mesh` and compatible `pi-interactive-subagents` versions, this extension answers the synchronous `rpc-subagents:provider-source:v1` discovery event for `antigravity`, `antigravity-account-N`, `openai-codex` and `openai-codex-account-N`. It advertises `subagent-provider.ts`, a provider-only child entrypoint that registers only the account selected in the frozen loadout. It installs no tools, UI hooks, model restoration or automatic failover. Read-only child tool restrictions remain unchanged; provider code is trusted code, not a filesystem sandbox. Both updated extensions must be loaded in the parent. Codex children use the selected provider's stored OAuth. Custom `models.json` proxy routes remain intact; this plugin's exact published loopback slot route is instead accessed directly upstream using that slot's OAuth, retaining its published model metadata and avoiding dependence on the parent proxy's lifetime. Other provider families are unchanged.
+For `pi-agent-mesh` and compatible `pi-interactive-subagents` versions, this extension answers the synchronous `rpc-subagents:provider-source:v1` discovery event for `openai-codex`, `openai-codex-account-N`, `xai`, and `xai-account-N`. It advertises `subagent-provider.ts`, a provider-only child entrypoint that registers only the account selected in the frozen loadout. It installs no tools, UI hooks, model restoration or automatic failover. Read-only child tool restrictions remain unchanged; provider code is trusted code, not a filesystem sandbox. Both updated extensions must be loaded in the parent. Codex children use the selected provider's stored OAuth. Custom `models.json` proxy routes remain intact; this plugin's exact published loopback slot route is instead accessed directly upstream using that slot's OAuth, retaining its published model metadata and avoiding dependence on the parent proxy's lifetime. Other provider families are unchanged.
 
 ### Standalone ChatGPT/Codex and Grok fast modes
 
@@ -22,8 +22,8 @@ The bundled `grok/` implementation owns OAuth, token refresh, the model catalog,
 
 ## What it does
 
-- **Auto-discovers** every authenticated account from `~/.pi/agent/auth.json` (Anthropic Claude Pro/Max, OpenAI/ChatGPT Codex, Google Antigravity, Kimi For Coding, Cursor, Qwen/Alibaba, and Ollama) and builds the failover rotation dynamically — no manual config editing.
-- **Grows the rotation on login.** Run `/login`, choose **Use a subscription** for a subscription provider or select an `antigravity-account-N` slot for Google login. The next discovery sweep adds it to the rotation automatically.
+- **Auto-discovers** every authenticated account from `~/.pi/agent/auth.json` (Anthropic Claude Pro/Max, OpenAI/ChatGPT Codex, Kimi For Coding, Cursor, Qwen/Alibaba, and Ollama) and builds the failover rotation dynamically — no manual config editing.
+- **Grows the rotation on login.** Run `/login`, then choose **Use a subscription** for a subscription provider. The next discovery sweep adds it to the rotation automatically.
 - **Auto-discovers new Codex models per account.** At session start (and on `reload` / `rediscover`) it reads OpenAI's authenticated model catalog, mirrors each account's actually available models onto its Pi alias, and follows OpenAI's server priority. A new flagship can therefore win immediately without an extension release or a hard-coded model id.
 - **Handles auth failures without poisoning healthy OAuth accounts.** A generic final 401 briefly cools down a refreshable account and moves the current task forward. Explicit provider verdicts such as `authentication token has been invalidated` force an early refresh; if the refresh token is dead too, the slot is removed and Pi prints the interactive `/login` recovery steps.
 - **Fails over on quota / rate-limit** (429 / 402 / 403 and friends): the exhausted account goes on cooldown (parsed from the provider's own reset metadata when available) and Pi first tries another account of the same family that still has the exact model and thinking level. A 100% usage forecast is not a skip: that sibling is asked unless it already refused this session. Another family is used only when no sibling can take the model.
@@ -47,13 +47,7 @@ extension keeps working across pi-ai upgrades. If a pi-ai it cannot adapt is eve
 extension still loads and API-key accounts keep rotating; only subscription login is unavailable,
 and it says so at session start.
 
-> **Anthropic (Claude Pro/Max) and Google Antigravity work out of the box.**
-> Antigravity's base `antigravity` provider and every `antigravity-account-*` alias
-> use Google OAuth and the native Cloud Code Assist stream. Do not also load the
-> standalone `pi-antigravity` extension, as both packages register the base provider.
-> AGY models refresh per account at startup and with `/multi-account rediscover`. Each
-> account keeps its own cached catalog and thinking routes; new generations need no static-list update.
-> This integration deliberately excludes Antigravity image generation commands/tools.
+> **Anthropic (Claude Pro/Max) works out of the box.**
 
 ### Recommended setting
 
@@ -71,7 +65,6 @@ Add accounts by opening the login picker:
 /login
 Use a subscription
 ChatGPT Plus/Pro (Codex openai-codex-account-2)
-# Or choose Antigravity (antigravity-account-2) and complete Google sign-in
 /multi-account rediscover
 ```
 
@@ -83,6 +76,8 @@ Check what's in the rotation at any time:
 ```text
 /multi-account status
 ```
+
+Status renders the last known quota immediately and refreshes expired snapshots in the background. Run it again to see the refreshed values. A failed quota request keeps the previous snapshot instead of replacing it with an empty result; the next refresh can retry. Request deadlines cover both response headers and body parsing.
 
 Force-refresh and display detailed limits for the active account:
 
@@ -112,15 +107,15 @@ The interactive view uses the active Pi theme for status, quota, warning, and mu
 
 ### Commands
 
-Use `/status` for the account overview (`/status full` for complete diagnostics). The management command keeps its three aliases: `/multi-account`, `/provider-failover`, `/failover`.
+Use `/status` for the account overview (`/status full` for complete diagnostics). Use `/multi-account` for management. Redundant top-level aliases `/provider-failover`, `/failover`, `/limits`, and `/quota` are not registered; detailed limits remain available through `/multi-account limits`.
 
 | Subcommand | Description |
 |---|---|
 | `status` (default) | Show a compact overview of the current model, limits, rotation, recovery, and actionable warnings. It refreshes every authenticated rotation account whose cache has expired (Codex: five minutes by default; Anthropic: at least ten minutes), even when the footer is disabled; repeated commands within that TTL use the cache. This is also available directly as `/status`; use `/status full` (aliases: `verbose`, `details`) for every diagnostic and registered login slot. |
 | `limits [refresh]` | Show active-account limits; `refresh` bypasses the cache. Codex and Claude use their 5h/7d windows. xAI OAuth uses the Grok CLI billing period and subscription name, and only shows a percent when that endpoint publishes one. This explicit query works even when `showUsage` is false. Aliases: `usage`, `quota`. |
-| `rediscover` | Force a re-scan of `auth.json`, rebuild the rotation, and refresh Codex, Antigravity, and Ollama model catalogs now. |
-| `add [anthropic\|codex\|kimi\|antigravity\|cursor\|ollama\|qwen]` | Print the next free account slot to select from the interactive `/login` picker. Anthropic, Codex, Kimi, Cursor, and Antigravity are logged in through `/login`; API-key families are filled in `auth.json`. |
-| `remove [anthropic\|codex\|kimi\|antigravity\|cursor\|ollama\|qwen\|<provider-id>]` | Remove an account from `auth.json` and rotation. Family name drops the highest numbered alias slot; a full provider id removes that exact slot. Aliases: `rm`, `delete`. |
+| `rediscover` | Force a re-scan of `auth.json`, rebuild the rotation, and refresh Codex and Ollama model catalogs now. |
+| `add [anthropic\|codex\|kimi\|cursor\|ollama\|qwen]` | Print the next free account slot to select from the interactive `/login` picker. Anthropic, Codex, Kimi, and Cursor are logged in through `/login`; API-key families are filled in `auth.json`. |
+| `remove [anthropic\|codex\|kimi\|cursor\|ollama\|qwen\|<provider-id>]` | Remove an account from `auth.json` and rotation. Family name drops the highest numbered alias slot; a full provider id removes that exact slot. Aliases: `rm`, `delete`. |
 | `next` | Manually switch to the next fallback, deliberately overriding recorded cooldowns. |
 | `only-active [on\|off]` | Narrow `/model` to the active rotation account: every other provider's models are hidden (its auth is preserved) and restored on switch or `off`. Alias: `focus`. |
 | `stop` | Abort and cancel automatic failover/resume for the current task. |
@@ -133,7 +128,7 @@ Use `/status` for the account overview (`/status full` for complete diagnostics)
 - **Joins the rotation** when an account has a present, non-expired credential in `auth.json` (after `/login`).
 - **Leaves the rotation** when the credential is logged out / removed, its access token is expired with no refresh token, an API key is rejected, or a refreshable OAuth credential produces three distinct final auth failures without a success in between.
 - **Quota / rate-limit** does not invalidate an account — it puts it on a temporary cooldown and the account returns once the cooldown expires.
-- **Duplicate identities** share one rotation position and one cooldown, and status/startup identifies the redundant slot. Codex/ChatGPT JWTs are matched by workspace plus user identity; Antigravity uses the Google email returned at login; identical API keys or literal identical tokens are also matched. Separate Anthropic OAuth logins cannot be proven identical because Anthropic's stored credential exposes no stable account identifier.
+- **Duplicate identities** share one rotation position and one cooldown, and status/startup identifies the redundant slot. Codex/ChatGPT JWTs are matched by workspace plus user identity; identical API keys or literal identical tokens are also matched. Separate Anthropic OAuth logins cannot be proven identical because Anthropic's stored credential exposes no stable account identifier.
 
 Rotation refresh is triggered by changes to `auth.json` (detected on session/turn start) or on demand with `/multi-account rediscover`.
 
@@ -151,13 +146,13 @@ A default config is created at `~/.pi/agent/provider-failover.json` on first run
 | `enabled` | `true` | Master switch. |
 | `autoContinue` | `true` | Queue a continuation prompt after a switch. |
 | `autoDiscover` | `true` | Auto-discover accounts from `auth.json`. |
-| `autoDiscoverModels` | `true` | Refresh live Codex, Antigravity, and Ollama model catalogs. Antigravity catalogs and thinking routes are isolated per account and cached for four hours; `rediscover` bypasses that TTL. |
+| `autoDiscoverModels` | `true` | Refresh live Codex and Ollama model catalogs. `rediscover` bypasses the catalog TTL. |
 | `includeQwen` | `true` | Include Qwen / Alibaba accounts. |
 | `includeOllama` | `true` | Include Ollama (local) accounts. |
 | `neverFailoverProviders` | `[]` | Provider ids to never fail away from, e.g. `["my-provider"]`. For **unmanaged** providers that run their own retry logic (typically a companion extension owning retries for that provider) — switching accounts underneath it would fight those retries. Managed accounts still cool and rotate normally. |
 | `includeCursor` | `true` | Include Cursor subscription accounts. The Cursor provider is a separate, optional repo — until it is cloned this setting does nothing at all: no cursor login slot is offered and no warning is printed. Run `/multi-account add cursor` to get the install instructions. |
 | `childProxy` | `true` | Serve OAuth rotation slots to processes that do not load this extension (a memory extension consolidating its notes, an external CLI, any `pi -p --no-extensions` call) through a loopback route this process owns. Without it such a child resolves the active slot by name, fails at authentication, and silently reroutes to whichever provider Pi finds first — a different account, usually a different vendor. The published route carries a non-secret placeholder; the real credential never leaves the parent. |
-| `providerOrder` | `["anthropic","openai-codex","kimi-coding","antigravity","cursor","qwen","ollama"]` | Preferred family order in the rotation. |
+| `providerOrder` | `["anthropic","openai-codex","kimi-coding","cursor","qwen","ollama"]` | Preferred family order in the rotation. |
 | `cooldownMs` | 6 h | Default cooldown when no reset metadata is provided. |
 | `showUsage` | `true` | Show active Codex/Claude limits in Pi's footer and poll them automatically. When false, the footer and background quota polling are disabled, but explicit `status`/`limits` commands can still refresh quota. |
 | `usageRefreshMs` | 5 min | Per-account usage cache TTL; every authenticated rotation account is refreshed independently, and Anthropic is clamped to at least 10 min to avoid endpoint throttling. |

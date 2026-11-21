@@ -11,7 +11,7 @@ import { placeholderKeyFor } from "../slot-proxy.ts";
 import subagentProvider from "../subagent-provider.ts";
 
 // Capture only discovery registration, without running the parent's session machinery.
-test("discovery advertises Codex and Antigravity provider-only entrypoint", () => {
+test("discovery advertises Codex and xAI provider-only entrypoint", () => {
   let handler: (request: any) => void;
   const stop = new Error("stop after discovery registration");
   assert.throws(() => multiAccount({ events: { on(event: string, fn: typeof handler) {
@@ -19,7 +19,7 @@ test("discovery advertises Codex and Antigravity provider-only entrypoint", () =
     handler = fn;
     throw stop;
   } } } as any), (error) => error === stop);
-  for (const provider of ["openai-codex", "openai-codex-account-2", "antigravity", "antigravity-account-2"]) {
+  for (const provider of ["openai-codex", "openai-codex-account-2", "xai", "xai-account-2"]) {
     const paths: string[] = [];
     handler!({ provider, register: (path: string) => paths.push(path) });
     assert.deepEqual(paths, [new URL("../subagent-provider.ts", import.meta.url).pathname]);
@@ -44,7 +44,6 @@ for (const { provider, overlay, route, ownedKey, direct } of [
   { provider: "openai-codex-account-2", overlay: true },
   { provider: "openai-codex", overlay: false },
   { provider: "openai-codex-account-2", overlay: false },
-  { provider: "antigravity-account-2", overlay: false },
   { provider: "openai-codex-account-2", overlay: true, route: "http://127.0.0.1:9999/openai-codex-account-2", ownedKey: true, direct: true },
   { provider: "openai-codex-account-2", overlay: true, route: "http://127.0.0.1:9999/openai-codex-account-3", ownedKey: true },
   { provider: "openai-codex-account-2", overlay: true, route: "http://127.0.0.1:9999/openai-codex-account-2", ownedKey: false },
@@ -60,11 +59,14 @@ for (const { provider, overlay, route, ownedKey, direct } of [
       const model = `${provider}/${modelId}`;
       const inputPath = join(root, "input.json");
       writeFileSync(inputPath, JSON.stringify(protocol === "role-run" ? { plan: { model } } : { model }));
+      const protocolEnvKey = protocol === "role-run" ? "PI_RPC_SUBAGENT_ROLE_RUN" : "PI_RPC_SUBAGENT_LOADOUT";
       const driver = `
 import assert from 'node:assert/strict';
 import { ModelRuntime } from ${JSON.stringify(pathToFileURL(host).href)};
 import { AuthStorage } from ${JSON.stringify(storage)};
 import child from ${JSON.stringify(entrypoint)};
+process.env.PI_RPC_SUBAGENT_CHILD = "1";
+process.env[${JSON.stringify(protocolEnvKey)}] = ${JSON.stringify(inputPath)};
 const provider = ${JSON.stringify(provider)};
 const baseUrl = ${JSON.stringify(expectedUrl)};
 const modelId = ${JSON.stringify(modelId)};
@@ -75,9 +77,6 @@ assert.deepEqual(registrations.map(p => p.id), [provider]);
 const config = registrations[0].config;
 assert.equal(typeof config.oauth.refreshToken, 'function');
 assert.equal(typeof config.oauth.getApiKey, 'function');
-if (provider.startsWith('antigravity')) {
-  assert.equal(typeof config.streamSimple, 'function');
-} else {
   const token = account => 'test.' + Buffer.from(JSON.stringify({
     'https://api.openai.com/auth': { chatgpt_account_id: account }
   })).toString('base64url') + '.signature';
@@ -112,7 +111,6 @@ if (provider.startsWith('antigravity')) {
   assert.equal(requests, 1);
   assert.equal(result.stopReason, 'stop', result.errorMessage);
   assert.equal(result.provider, provider);
-}
 console.log('child preflight OK');
 `;
       writeFileSync(join(root, "driver.mjs"), driver);
@@ -168,7 +166,7 @@ test("child startup validates identity, input and provider for both protocols", 
     assert.deepEqual(registrations, []);
 
     const rolePath = join(root, "role-run.json");
-    writeFileSync(rolePath, JSON.stringify({ model: "antigravity/gemini", plan: { model: "openai-codex-account-2/gpt-5.4" } }));
+    writeFileSync(rolePath, JSON.stringify({ model: "anthropic/claude", plan: { model: "openai-codex-account-2/gpt-5.4" } }));
     process.env.PI_RPC_SUBAGENT_ROLE_RUN = rolePath;
     process.env.PI_RPC_SUBAGENT_LOADOUT = join(root, "missing-legacy.json");
     subagentProvider(pi);

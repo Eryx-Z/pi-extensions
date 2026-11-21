@@ -454,15 +454,17 @@ export function renderPlainReport(
 
 export async function showTokensUi(
   ctx: ExtensionCommandContext,
-  initial: ScanResult,
+  initial: ScanResult | Promise<ScanResult>,
   initialWindow: TimeWindow,
   rescan: () => Promise<ScanResult>,
+  refreshOnOpen = false,
 ): Promise<void> {
   await ctx.ui.custom<void>((tui, theme, _keybindings, done) => {
-    let result = initial;
+    let result: ScanResult | undefined = initial instanceof Promise ? undefined : initial;
     let window = initialWindow;
     let now = Date.now();
     let refreshing = false;
+    let disposed = false;
     let refreshError: string | undefined;
     let cachedWidth: number | undefined;
     let cachedLines: string[] | undefined;
@@ -477,39 +479,60 @@ export async function showTokensUi(
       invalidate();
       tui.requestRender();
     };
-    const refresh = () => {
-      if (refreshing) return;
+    const update = (next: ScanResult | undefined) => {
+      if (disposed || !next) return;
+      result = next;
+      now = Date.now();
+      invalidate();
+      tui.requestRender();
+    };
+    const refresh = (load: () => Promise<ScanResult | undefined> = rescan) => {
+      if (refreshing || disposed) return;
       refreshing = true;
       refreshError = undefined;
       invalidate();
       tui.requestRender();
-      void rescan()
-        .then((next) => {
-          result = next;
-          now = Date.now();
-        })
-        .catch((error: unknown) => {
-          refreshError = `Refresh failed: ${error instanceof Error ? error.message : String(error)}`;
+      void Promise.resolve().then(load)
+        .then(update)
+        .catch(() => {
+          // Never expose raw errors or session content in the report.
+          if (!disposed) refreshError = "Refresh failed. Press r to retry.";
         })
         .finally(() => {
+          if (disposed) return;
           refreshing = false;
           invalidate();
           tui.requestRender();
         });
     };
 
+    if (initial instanceof Promise || refreshOnOpen) {
+      refresh(async () => {
+        update(await initial);
+        if (!disposed && refreshOnOpen) return rescan();
+        return undefined;
+      });
+    }
+
     return {
       render(width: number): string[] {
         if (cachedLines && cachedWidth === width) return cachedLines;
-        const aggregate = aggregateUsage(result.records, window, now);
-        const status = refreshing ? "Refreshing…" : refreshError;
-        cachedLines = styleLines(buildReportLines(aggregate, window, result.diagnostics, width, status, theme), theme);
+        if (!result) {
+          cachedLines = [theme.fg("muted", refreshError ?? "Loading usage…"), theme.fg("dim", "r retry · q close")]
+            .map((line) => truncateLine(line, width));
+        } else {
+          const aggregate = aggregateUsage(result.records, window, now);
+          const status = refreshing ? "Refreshing…" : refreshError;
+          cachedLines = styleLines(buildReportLines(aggregate, window, result.diagnostics, width, status, theme), theme);
+        }
         cachedWidth = width;
         return cachedLines;
       },
       invalidate,
+      dispose(): void { disposed = true; },
       handleInput(data: string): void {
         if (matchesKey(data, "escape") || data.toLowerCase() === "q") {
+          disposed = true;
           done(undefined);
           return;
         }

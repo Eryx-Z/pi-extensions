@@ -60,8 +60,17 @@ async function harness() {
     credentials: new InMemoryCredentialStore(), modelsStore: new InMemoryModelsStore(),
   });
   const registry = new ModelRegistry(runtime);
-  const stream = (usedModel: Model<string>, context: Context, options?: StreamOptions) => {
+  const stream = (usedModel: Model<string>, rawContext: Context, options?: StreamOptions) => {
     const events = createAssistantMessageEventStream();
+    const firstMsg = rawContext.messages[0] as { role?: string; content?: unknown; toolsAdded?: Context["tools"] } | undefined;
+    const systemFolded = firstMsg?.role === "system";
+    const context: Context = systemFolded
+      ? {
+          systemPrompt: typeof firstMsg?.content === "string" ? firstMsg.content : rawContext.systemPrompt,
+          tools: firstMsg?.toolsAdded ?? rawContext.tools,
+          messages: rawContext.messages.slice(1),
+        }
+      : rawContext;
     const content = context.messages[0].content;
     assert.equal(typeof content, "string");
     const call: Call = { model: usedModel, context, options: options ?? {}, results: JSON.parse(content as string).results };
@@ -305,6 +314,23 @@ test("multimodal outputs, unknown blocks and block metadata never enter generati
   ];
   assert.equal((await guard.apply(messages, settings, h.ctx)).messages, messages);
   assert.equal(h.calls.length, 0);
+});
+
+test("strips markdown json code fences before parsing summary JSON", async () => {
+  const h = await harness();
+  const guard = createSummaryGuard();
+  const messages = [output()];
+  h.control.reply = (call) => response(
+    "```json\n" + JSON.stringify({
+      [call.results[0].key]: "Observed error at /tmp/result, exit code 2. No files changed.",
+    }) + "\n```",
+    "stop",
+    true,
+  );
+  const result = await guard.apply(messages, settings, h.ctx);
+  assert.equal(result.summaryError, undefined);
+  assert.equal(result.elidedNow, 1);
+  assert.ok(text(result.messages[0]).startsWith(SUMMARY_MARKER));
 });
 
 test("bash summaries preserve command, exit code, flags and unknown fields", async () => {

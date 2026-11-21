@@ -1,6 +1,7 @@
-import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 
 /** Wire value used by Codex priority processing. */
 export const CODEX_FAST_SERVICE_TIER = "priority";
@@ -28,30 +29,54 @@ export function codexFastPreferencePath(
 	return join(agentDir, CODEX_FAST_PREFERENCE_NAME);
 }
 
+const codexFastCache = new Map<string, { stamp: string; enabled: boolean }>();
+
 /** Missing or unreadable preference means on, matching pi-codex-fast-mode. */
 export function readCodexFastEnabled(path = codexFastPreferencePath()): boolean {
+	const key = resolve(path);
 	try {
-		const parsed = JSON.parse(readFileSync(path, "utf8"));
-		if (
-			parsed &&
-			typeof parsed === "object" &&
-			!Array.isArray(parsed) &&
-			typeof (parsed as { enabled?: unknown }).enabled === "boolean"
-		) {
-			return (parsed as { enabled: boolean }).enabled;
+		const st = statSync(key);
+		const stamp = `${st.ino}:${st.size}:${st.mtimeMs}:${st.ctimeMs}`;
+		const cached = codexFastCache.get(key);
+		if (cached && cached.stamp === stamp) return cached.enabled;
+		let enabled = true;
+		try {
+			const parsed = JSON.parse(readFileSync(key, "utf8"));
+			if (
+				parsed &&
+				typeof parsed === "object" &&
+				!Array.isArray(parsed) &&
+				typeof (parsed as { enabled?: unknown }).enabled === "boolean"
+			) {
+				enabled = (parsed as { enabled: boolean }).enabled;
+			}
+		} catch {
+			enabled = true;
 		}
+		codexFastCache.set(key, { stamp, enabled });
+		return enabled;
 	} catch {
-		// ENOENT and corrupt files both fall through to the default.
+		codexFastCache.set(key, { stamp: "ENOENT", enabled: true });
+		return true;
 	}
-	return true;
 }
 
 export function writeCodexFastEnabled(enabled: boolean, path = codexFastPreferencePath()): void {
-	mkdirSync(dirname(path), { recursive: true });
-	const temporary = `${path}.${process.pid}.${Date.now()}.tmp`;
+	const key = resolve(path);
+	mkdirSync(dirname(key), { recursive: true });
+	const temporary = `${key}.${process.pid}.${randomUUID()}.tmp`;
 	try {
 		writeFileSync(temporary, `${JSON.stringify({ enabled })}\n`, { mode: 0o600 });
-		renameSync(temporary, path);
+		renameSync(temporary, key);
+		try {
+			const st = statSync(key);
+			codexFastCache.set(key, {
+				stamp: `${st.ino}:${st.size}:${st.mtimeMs}:${st.ctimeMs}`,
+				enabled,
+			});
+		} catch {
+			codexFastCache.delete(key);
+		}
 	} finally {
 		rmSync(temporary, { force: true });
 	}

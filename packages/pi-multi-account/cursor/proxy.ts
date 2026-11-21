@@ -499,6 +499,7 @@ export async function startProxy(
     server.on("error", (error) => debugLog("http.server_error", { error: String(error) }));
 
     server.listen(0, "127.0.0.1", () => {
+      server.unref();
       const addr = server.address();
       if (typeof addr === "object" && addr) {
         proxyPort = addr.port;

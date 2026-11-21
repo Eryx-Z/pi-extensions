@@ -48,18 +48,68 @@ export const PROXY_PLACEHOLDER_KEY = "pi-multi-account-proxy";
  * the authorization header and the account id with the genuine values on the way out, so the
  * published file never carries either.
  */
-export const PROXY_PLACEHOLDER_JWT = [
-	Buffer.from(JSON.stringify({ alg: "none", typ: "JWT" })).toString("base64"),
-	Buffer.from(
-		JSON.stringify({
-			"https://api.openai.com/auth": { chatgpt_account_id: PROXY_PLACEHOLDER_KEY },
-		}),
-	).toString("base64"),
-	"",
-].join(".");
+import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { get as httpGet } from "node:http";
+import { homedir } from "node:os";
+import { join, resolve as resolvePath } from "node:path";
+import { applyCodexFastMode, readCodexFastEnabled } from "./codex-fast.ts";
 
-/** Either published placeholder — neither is a credential, both mark "a child we published for". */
-export function isPublishedPlaceholder(value: string | undefined): boolean {
+/** Build an alg:"none" loopback JWT carrying a non-secret placeholder account id for Pi's Codex parser. */
+export function buildPlaceholderJwt(accountMarker: string): string {
+	return [
+		Buffer.from(JSON.stringify({ alg: "none", typ: "JWT" })).toString("base64"),
+		Buffer.from(
+			JSON.stringify({
+				"https://api.openai.com/auth": { chatgpt_account_id: accountMarker },
+			}),
+		).toString("base64"),
+		"",
+	].join(".");
+}
+
+export const PROXY_PLACEHOLDER_JWT = buildPlaceholderJwt(PROXY_PLACEHOLDER_KEY);
+
+export function defaultSlotProxyKeyPath(): string {
+	return (
+		process.env.PI_SLOT_PROXY_KEY_PATH ||
+		join(homedir(), ".config", "pi", "secrets", "slot-proxy-key")
+	);
+}
+
+/** Derive a per-user non-secret loopback admission marker from ~/.config/pi/secrets/slot-proxy-key. */
+export function deriveSlotProxyKey(secret: string): string {
+	const digest = createHash("sha256")
+		.update(`pi-multi-account-slot-proxy:v1:${secret}`)
+		.digest("hex")
+		.slice(0, 32);
+	return `pi-slot-proxy-${digest}`;
+}
+
+export function resolveDerivedProxyKey(secretPath = defaultSlotProxyKeyPath()): string | undefined {
+	try {
+		const raw = readFileSync(secretPath, "utf8").trim();
+		if (!raw) return undefined;
+		return deriveSlotProxyKey(raw);
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Strictly enforce the per-user placeholder derived from ~/.config/pi/secrets/slot-proxy-key
+ * whenever that secret is configured (rejecting public constants across UIDs), and fall back to
+ * legacy constants only when no per-user secret file exists.
+ */
+export function isPublishedPlaceholder(
+	value: string | undefined,
+	secretPath = defaultSlotProxyKeyPath(),
+): boolean {
+	if (!value) return false;
+	const derived = resolveDerivedProxyKey(secretPath);
+	if (derived) {
+		return value === derived || value === buildPlaceholderJwt(derived);
+	}
 	return value === PROXY_PLACEHOLDER_KEY || value === PROXY_PLACEHOLDER_JWT;
 }
 
@@ -163,12 +213,13 @@ export function admitRequest(args: {
 	rawUrl: string;
 	headers: Readonly<Record<string, string | string[] | undefined>>;
 	routes: ReadonlyMap<string, ProxyRoute>;
+	secretPath?: string;
 }): Admission & { rest?: string } {
 	const parsed = parseProxyPath(args.rawUrl);
 	if (!parsed) return { ok: false, status: 404, message: "not a slot route" };
 	const route = args.routes.get(parsed.slotId);
 	if (!route) return { ok: false, status: 404, message: "unknown slot" };
-	if (!isPublishedPlaceholder(presentedCredential(args.headers))) {
+	if (!isPublishedPlaceholder(presentedCredential(args.headers), args.secretPath)) {
 		// Never echo what was presented: it may be a real credential belonging to whoever called.
 		return { ok: false, status: 401, message: "this route serves published slots only" };
 	}
@@ -257,12 +308,108 @@ function mergeBeta(existing: string | undefined, required: string): string {
 	return parts.join(",");
 }
 
-/** The `apiKey` to publish for a slot of this family. */
-export function placeholderKeyFor(family: ProxyFamily): string {
+/** The `apiKey` to publish for a slot of this family (per-user derived when slot-proxy-key exists). */
+export function placeholderKeyFor(
+	family: ProxyFamily,
+	secretPath = defaultSlotProxyKeyPath(),
+): string {
+	const derived = resolveDerivedProxyKey(secretPath);
+	if (derived) {
+		return family === "codex" ? buildPlaceholderJwt(derived) : derived;
+	}
 	return family === "codex" ? PROXY_PLACEHOLDER_JWT : PROXY_PLACEHOLDER_KEY;
+}
+
+/** Apply codex-fast-mode.json service_tier shaping to a proxied Codex JSON request body. */
+export function shapeProxyCodexBody(
+	body: Buffer,
+	enabled = readCodexFastEnabled(),
+): Buffer {
+	if (!body.length) return body;
+	try {
+		const parsed = JSON.parse(body.toString("utf8"));
+		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return body;
+		applyCodexFastMode(parsed, enabled);
+		return Buffer.from(JSON.stringify(parsed));
+	} catch {
+		return body;
+	}
 }
 
 /** The `models.json` route to publish for a slot served by this proxy. */
 export function publishedRouteFor(port: number, slotId: string): string {
 	return `http://127.0.0.1:${port}/${slotId}`;
+}
+
+export const SLOT_PROXY_HEALTH_PATH = "/__pi_multi_account_health__";
+
+export function hashAgentDir(agentDir: string): string {
+	return createHash("sha256").update(resolvePath(agentDir)).digest("hex").slice(0, 12);
+}
+
+/**
+ * Recognize a healthy loopback slot-proxy serving the same agentDir on this machine via its
+ * explicit health endpoint only — never exempt generic or legacy 404 responses.
+ */
+export function isHealthySlotProxyProbe(
+	status: number,
+	bodyText: string,
+	expectedAgentDirHash?: string,
+	isDefaultAgentDir = true,
+): boolean {
+	try {
+		const parsed = JSON.parse(bodyText);
+		if (status === 200 && parsed?.ok === true && parsed?.service === "pi-multi-account-slot-proxy") {
+			if (expectedAgentDirHash && typeof parsed.agentDirHash === "string") {
+				return parsed.agentDirHash === expectedAgentDirHash;
+			}
+			return expectedAgentDirHash ? isDefaultAgentDir : true;
+		}
+		return false;
+	} catch {
+		return false;
+	}
+}
+
+export function probeHealthySlotProxy(
+	port: number,
+	agentDir?: string,
+	timeoutMs = 250,
+): Promise<boolean> {
+	const defaultAgentDir = resolvePath(join(homedir(), ".pi", "agent"));
+	const resolvedDir = agentDir ? resolvePath(agentDir) : undefined;
+	const expectedHash = resolvedDir ? hashAgentDir(resolvedDir) : undefined;
+	const isDefaultDir = resolvedDir ? resolvedDir === defaultAgentDir : true;
+	return new Promise<boolean>((resolve) => {
+		let settled = false;
+		const done = (value: boolean) => {
+			if (settled) return;
+			settled = true;
+			resolve(value);
+		};
+		const req = httpGet(
+			{
+				host: "127.0.0.1",
+				port,
+				path: SLOT_PROXY_HEALTH_PATH,
+				timeout: timeoutMs,
+			},
+			(res) => {
+				let body = "";
+				res.setEncoding("utf8");
+				res.on("data", (chunk: string) => {
+					if (body.length < 4096) body += chunk;
+				});
+				res.on("end", () => {
+					done(isHealthySlotProxyProbe(res.statusCode ?? 0, body, expectedHash, isDefaultDir));
+				});
+				res.on("error", () => done(false));
+			},
+		);
+		req.on("timeout", () => {
+			req.destroy();
+			done(false);
+		});
+		req.on("error", () => done(false));
+	});
 }

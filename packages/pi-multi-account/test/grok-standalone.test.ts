@@ -78,7 +78,7 @@ test('standalone request uses fast model, Grok headers, sanitizer, bearer token 
         return new Response('data: ' + JSON.stringify({ type: 'response.completed', response: { id: 'synthetic-response', status: 'completed', output: [], usage: { input_tokens: 1, output_tokens: 0 } } }) + '\n\n', { headers: { 'content-type': 'text/event-stream' } });
       },
     }).result();
-    assert.equal(result.stopReason, 'stop', result.errorMessage);
+    assert.equal(result.stopReason, 'stop', result.errorMessage ?? '');
     assert.equal(requests, 1);
   } finally {
     if (env === undefined) delete process.env.GROK_CLI_OAUTH_TOKEN; else process.env.GROK_CLI_OAUTH_TOKEN = env;

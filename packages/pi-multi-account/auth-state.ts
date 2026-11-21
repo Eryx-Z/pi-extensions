@@ -4,12 +4,14 @@ import {
 	readFileSync,
 	writeFileSync,
 	renameSync,
+	rmSync,
 	accessSync,
 	constants as fsConstants,
 	statSync,
 } from "node:fs";
 import { AUTH_PATH } from "./agent-paths.ts";
-import { createHash } from "node:crypto";
+import { withFileLockSync } from "./file-lock.ts";
+import { createHash, randomUUID } from "node:crypto";
 
 // ---------------------------------------------------------------------------
 // auth.json reading, account identity & token validity
@@ -22,31 +24,82 @@ export type AuthEntry = {
 	expires?: number;
 	key?: string;
 	accountId?: string;
-	/** Cloud Code Assist project selected during Antigravity OAuth. */
-	projectId?: string;
-	/** Stable Google identity used to deduplicate Antigravity login slots. */
 	email?: string;
 };
 
+let authCache:
+	| { path: string; stamp: string; value: Record<string, AuthEntry> }
+	| undefined;
+
 export function readAuthFile(): Record<string, AuthEntry> {
 	try {
-		return JSON.parse(readFileSync(AUTH_PATH, "utf8")) as Record<
+		const st = statSync(AUTH_PATH);
+		const stamp = `${st.ino}:${st.size}:${st.mtimeMs}:${st.ctimeMs}`;
+		if (authCache && authCache.path === AUTH_PATH && authCache.stamp === stamp) {
+			return structuredClone(authCache.value);
+		}
+		const parsed = JSON.parse(readFileSync(AUTH_PATH, "utf8")) as Record<
 			string,
 			AuthEntry
 		>;
+		const clean =
+			parsed && typeof parsed === "object" && !Array.isArray(parsed)
+				? parsed
+				: {};
+		authCache = { path: AUTH_PATH, stamp, value: clean };
+		return structuredClone(clean);
 	} catch {
+		authCache = undefined;
 		return {};
 	}
 }
 
-/** Atomic replace of auth.json, so a crash mid-write can never truncate credentials. */
-function writeAuthFile(data: Record<string, AuthEntry>): void {
-	const tmp = `${AUTH_PATH}.multi-account.tmp`;
-	writeFileSync(tmp, `${JSON.stringify(data, null, "\t")}\n`, {
-		encoding: "utf8",
-		mode: 0o600,
+function writeAuthFileUnlocked(data: Record<string, AuthEntry>): void {
+	const tmp = `${AUTH_PATH}.${process.pid}.${randomUUID()}.tmp`;
+	try {
+		writeFileSync(tmp, `${JSON.stringify(data, null, "\t")}\n`, {
+			encoding: "utf8",
+			mode: 0o600,
+		});
+		renameSync(tmp, AUTH_PATH);
+		try {
+			const st = statSync(AUTH_PATH);
+			authCache = {
+				path: AUTH_PATH,
+				stamp: `${st.ino}:${st.size}:${st.mtimeMs}:${st.ctimeMs}`,
+				value: structuredClone(data),
+			};
+		} catch {
+			authCache = undefined;
+		}
+	} finally {
+		try {
+			rmSync(tmp, { force: true });
+		} catch {
+			/* ignore cleanup errors */
+		}
+	}
+}
+
+/** Atomic, cross-process locked replace of auth.json so concurrent writers never truncate or clobber credentials. */
+export function writeAuthFile(data: Record<string, AuthEntry>): void {
+	withFileLockSync(AUTH_PATH, () => {
+		writeAuthFileUnlocked(data);
 	});
-	renameSync(tmp, AUTH_PATH);
+}
+
+export function updateAuthFileLocked<T>(
+	mutator: (current: Record<string, AuthEntry>) => { next?: Record<string, AuthEntry>; result: T },
+): T {
+	return withFileLockSync(AUTH_PATH, () => {
+		authCache = undefined;
+		const current = readAuthFile();
+		const { next, result } = mutator(current);
+		if (next !== undefined) {
+			writeAuthFileUnlocked(next);
+		}
+		return result;
+	});
 }
 
 function authFileIsWritable(): boolean {
@@ -113,9 +166,16 @@ export async function persistRefreshedCredentials(
 		}
 	}
 	try {
-		const read = io?.read ?? readAuthFile;
-		const write = io?.write ?? writeAuthFile;
-		write({ ...read(), [provider]: credential });
+		if (io?.read || io?.write) {
+			const read = io.read ?? readAuthFile;
+			const write = io.write ?? writeAuthFile;
+			write({ ...read(), [provider]: credential });
+		} else {
+			updateAuthFileLocked((current) => ({
+				next: { ...current, [provider]: credential },
+				result: true,
+			}));
+		}
 		return true;
 	} catch {
 		return false;
@@ -199,13 +259,6 @@ export function credentialHash(entry: AuthEntry): string | undefined {
  *     account are not deterministically identifiable from auth.json alone.
  */
 export function accountIdentity(entry: AuthEntry): string | undefined {
-	if (
-		typeof entry.projectId === "string" &&
-		entry.projectId &&
-		typeof entry.email === "string" &&
-		entry.email.trim()
-	)
-		return `antigravity:${hash12(entry.email.trim().toLowerCase())}`;
 	if (entry.access) {
 		const codexIdentity = codexAccountIdentity(entry.access);
 		if (codexIdentity) return codexIdentity;
@@ -230,13 +283,6 @@ export function accountIdentity(entry: AuthEntry): string | undefined {
  * lifted by rotating a token anyway, so erring toward "keep the cooldown" is correct.
  */
 export function stableAccountFingerprint(entry: AuthEntry): string | undefined {
-	if (
-		typeof entry.projectId === "string" &&
-		entry.projectId &&
-		typeof entry.email === "string" &&
-		entry.email.trim()
-	)
-		return `antigravity:${hash12(entry.email.trim().toLowerCase())}`;
 	if (entry.access) {
 		const codexIdentity = codexAccountIdentity(entry.access);
 		if (codexIdentity) return codexIdentity;

@@ -1,7 +1,7 @@
 {
   "name": "pi-multi-account",
   "version": "1.20.0",
-  "description": "Automatic multi-account failover & rotation for Pi Agent across Anthropic (Claude), OpenAI/ChatGPT Codex, Google Antigravity, Kimi For Coding, Cursor, Qwen/Alibaba, and Ollama. Auto-discovers authenticated accounts, grows the rotation on login, and drops accounts on logout, expiry, or quota/rate-limit errors",
+  "description": "Automatic multi-account failover & rotation for Pi Agent across Anthropic (Claude), OpenAI/ChatGPT Codex, Kimi For Coding, Cursor, Qwen/Alibaba, and Ollama. Auto-discovers authenticated accounts, grows the rotation on login, and drops accounts on logout, expiry, or quota/rate-limit errors",
   "type": "module",
   "license": "MIT",
   "author": "Eryx-Z",
@@ -39,10 +39,7 @@
     "oauth",
     "kimi",
     "kimi-coding",
-    "cursor",
-    "antigravity",
-    "google",
-    "gemini"
+    "cursor"
   ],
   "files": [
     "index.ts",
@@ -58,6 +55,7 @@
     "request-shaping.ts",
     "interrupted-turns.ts",
     "cooldown.ts",
+    "file-lock.ts",
     "pi-files.ts",
     "model-catalog.ts",
     "usage.ts",
@@ -66,24 +64,23 @@
     "provider-priority.ts",
     "child-usability.ts",
     "codex-fast.ts",
+    "xai-fast.ts",
     "fast-command.ts",
     "grok-cli-provider.ts",
     "grok",
     "pi-contract.ts",
     "slot-proxy.ts",
-    "antigravity",
     "cursor",
     "README.md",
     "CHANGELOG.md",
     "LICENSE",
-    "NOTICE",
     "SECURITY.md",
     "CONTRIBUTING.md"
   ],
   "scripts": {
     "check": "npm run typecheck",
     "typecheck": "tsc --noEmit",
-    "test": "node --import tsx --test test/*.test.ts",
+    "test": "node --experimental-transform-types --import ../../test/register-pi-peers.mjs --test test/*.test.ts",
     "pack:check": "node scripts/check-package.mjs",
     "release:check": "npm run check && npm test && npm run pack:check",
     "prepublishOnly": "npm run release:check"
@@ -95,10 +92,11 @@
     "access": "public"
   },
   "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*"
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "^0.85.1",
+    "@earendil-works/pi-coding-agent": "^1.6.0",
     "@types/node": "^22.20.1",
     "tsx": "^4.20.0",
     "typescript": "^6.0.3"
@@ -110,7 +108,6 @@
   },
   "dependencies": {
     "@bufbuild/protobuf": "^2.14.0",
-    "@earendil-works/pi-ai": "^0.85.1",
     "undici": "^8.10.2"
   },
   "overrides": {

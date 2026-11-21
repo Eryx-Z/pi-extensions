@@ -8,11 +8,10 @@
 
 | Package | Version | Description |
 | :--- | :---: | :--- |
-| [`pi-skill-manager`](./packages/pi-skill-manager) | `1.0.0` | Batch-manage automatic Skill invocation (`disable-model-invocation`), interactive TUI, `$` search & custom groups |
 | [`model-aware-autocompact`](./packages/model-aware-autocompact) | `1.0.0` | Automatic compaction with per-model thresholds and cached summaries of old tool output |
-| [`pi-multi-account`](./packages/pi-multi-account) | `1.20.0` | Automatic multi-account failover & rotation across Claude, Codex, Antigravity, Kimi, Cursor, Qwen, Ollama |
+| [`pi-multi-account`](./packages/pi-multi-account) | `1.20.0` | Automatic multi-account failover & rotation across Claude, Codex, Kimi, Cursor, Qwen, Ollama |
 | [`pi-token-usage`](./packages/pi-token-usage) | `0.1.0` | Local session token usage and cost visualization panel (`/usage`) |
-| [`pi-open-terminal`](./packages/pi-open-terminal) | `1.0.0` | Quick Kitty terminal launcher in current working directory via `/d` |
+| [`pi-open-terminal`](./packages/pi-open-terminal) | `1.0.0` | Quick `$TERMINAL` / Kitty terminal launcher in current working directory via `/d` |
 
 ---
 
@@ -38,7 +37,7 @@ If you only want specific extensions from this repository, configure `~/.pi/agen
     {
       "source": "git:github.com/Eryx-Z/pi-extensions",
       "extensions": [
-        "packages/pi-skill-manager/index.ts",
+        "packages/model-aware-autocompact/index.ts",
         "packages/pi-multi-account/index.ts"
       ]
     }
@@ -64,7 +63,7 @@ Clone this repository and point Pi to your local checkout in `~/.pi/agent/settin
 
 This project uses npm workspaces with Node 22.19+ and one root `package-lock.json`.
 Run dependency installation from the repository root, not from individual packages.
-All five workspaces must provide `test` and `typecheck` scripts; missing scripts fail
+All four workspaces must provide `test` and `typecheck` scripts; missing scripts fail
 the root checks rather than being silently skipped. Tests use Node's test runner
 with `tsx` to load TypeScript; all workspaces use the same TypeScript version range.
 The GitHub Actions workflow runs these checks on Node 22 and 24, plus the
@@ -91,7 +90,7 @@ npm run check
 
 ## 💖 Acknowledgments
 
-- **`pi-multi-account`**: Enhanced and customized with Google Antigravity failover & quota rotation, based on foundational work by [@Sarrius](https://github.com/Sarrius/pi-multi-account).
+- **`pi-multi-account`**: Based on foundational work by [@Sarrius](https://github.com/Sarrius/pi-multi-account).
 
 ---
 

@@ -60,7 +60,6 @@ export const MANAGED_GROUPS = [
   "anthropic",
   "openai-codex",
   "kimi-coding",
-  "antigravity",
   "cursor",
   "qwen",
   "ollama",
@@ -79,7 +78,6 @@ export const DEFAULT_PROVIDER_PRIORITY: string[] = [
   "anthropic",
   "openai-codex",
   "kimi-coding",
-  "antigravity",
   "cursor",
   "qwen",
   "ollama",
@@ -97,8 +95,6 @@ const ALIASES: Record<string, string> = {
   kimi: "kimi-coding",
   k3: "kimi-coding",
   moonshot: "kimi-coding",
-  antigravity: "antigravity",
-  agy: "antigravity",
   qwen: "qwen",
   alibaba: "qwen",
   dashscope: "qwen",
@@ -123,6 +119,7 @@ export function normalizeGroup(raw: string): string {
     .toLowerCase();
   if (!first) return "";
   const base = first.replace(/-account-\d+$/, "");
+  if (base === "antigravity" || base === "agy") return "";
   if ((MANAGED_GROUPS as readonly string[]).includes(base)) return base;
   const alias = ALIASES[base.replace(/[^a-z0-9]/g, "")];
   return alias ?? base;
